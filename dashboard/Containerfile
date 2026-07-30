@@ -1,0 +1,55 @@
+# Containerfile — CN8VX/radioprj SvxLink dashboard.
+#
+# This image is built LOCALLY on the target host as
+# `localhost/svxlink-dashboard:local` and is NEVER pushed to a registry:
+# the upstream tree carries an "All rights reserved" license badge (README
+# at the pinned commit — see docs/dashboard.md), so redistributing a built
+# image is not licensed; a private build on the operator's own node is.
+# `svx dashboard install` clones the fork at DASHBOARD_PIN into
+# ~/.svxlink/dashboard-src and runs `podman build` with that clone as the
+# build context. The clone's .git/ directory rides along in the COPY —
+# tolerated: the image never leaves this host, and excluding it would mean
+# writing a .containerignore into a third-party tree we keep pristine.
+FROM php:8.3-apache
+
+# procps (free/uptime/ps) and iproute2 (ip) back the hardware/status
+# panels that shell out to those tools; GNU grep — including the -P mode
+# the log parsers use — is already in the Debian base image, so nothing
+# grep-related is installed here. --no-install-recommends keeps the layer
+# small on Pi-class hosts.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        procps \
+        iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# The whole cloned tree, then ONE marked interop patch (below). Every
+# knob the dashboard exposes lives in include/{config,dash_config}.php
+# and include/talkgroups.json. All three are bind-mounted READ-ONLY over
+# these baked copies at runtime (quadlets/svxlink-dashboard.container.
+# template) — bind mounts always win over image content, so the baked
+# include/ files only ever matter for a bare `podman run` without the
+# mounts (debugging). Log and svxlink-config data arrive the same way:
+# ~/.svxlink/log at /var/log/svxlink (ro) and a SANITIZED
+# ModuleEchoLink.conf copy at /etc/svxlink/svxlink.d/ModuleEchoLink.conf
+# (ro) — the real svxlink.d/ with the plaintext EchoLink password never
+# enters this container.
+COPY . /var/www/html/
+
+# Single minimal interop patch (attribution and version retained per the
+# upstream notice; the tree is otherwise pristine): the fork's hw_cmd()
+# returns shell_exec()'s raw result, which is NULL whenever a probed
+# command is absent or silent — inevitable here, where svxlink runs in a
+# SIBLING container. That null then walks through `$o !== ''` guards
+# (true for null!) until hw_svxlinkVersion()'s `return $o2` violates its
+# `: string` type and PHP >= 8 FATALS, blanking the whole page (observed
+# 2026-07-30 on the pinned commit). Normalizing null to '' inside the
+# producer restores the CN8VX original's hw_cmd contract and fixes every
+# downstream null-deprecation at once. Verified against the pinned
+# commit; re-verify when bumping DASHBOARD_PIN (grep must find exactly
+# one occurrence — the build fails loudly below if the line moved).
+RUN grep -c "return @shell_exec('LC_ALL=C ' . \$cmd . ' 2>/dev/null');" \
+        /var/www/html/include/hardware_info.php | grep -qx 1 \
+    && sed -i \
+        "s|return @shell_exec('LC_ALL=C ' . \$cmd . ' 2>/dev/null');|return @shell_exec('LC_ALL=C ' . \$cmd . ' 2>/dev/null') ?? '';|" \
+        /var/www/html/include/hardware_info.php

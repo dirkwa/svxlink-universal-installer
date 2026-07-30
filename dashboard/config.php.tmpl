@@ -1,0 +1,126 @@
+<?php
+/**
+ * ================================================================
+ *  SvxLink Dashboard by CN8VX & SP2ONG — Configuration File
+ *
+ *  Template shipped by svxlink-universal-installer. Mirrors
+ *  include/config.php of the radioprj fork at the pinned commit
+ *  (see docs/dashboard.md) with __SVX_*__ placeholders that
+ *  `svx dashboard install` fills via sed when seeding
+ *  ~/.svxlink/dashboard/config.php. Seeded ONLY if absent; the
+ *  seeded file is operator-owned afterwards — hand edits survive
+ *  every dashboard rebuild because it is bind-mounted read-only
+ *  over the baked copy inside the container.
+ * ================================================================
+ */
+
+// ============================================================
+// VISUAL CONFIGURATION
+// ============================================================
+
+// Title / subtitle of the dashboard
+define('DASHBOARD_SUBTITLE', '__SVX_SUBTITLE__');
+
+// QTH displayed in the header (leave empty to hide)
+define('HEADER_QTH', '__SVX_QTH__');
+
+//============================================================
+// Frequency displayed in the header (leave empty to hide).
+// If you use CTCSS, set REPORT_CTCSS in the [SimplexLogic] /
+// [RepeaterLogic] section of svxlink.conf. For a repeater give both
+// FREQ_RX and FREQ_TX; for simplex only FREQ_RX ('---.---' hides it).
+define('FREQ_RX', '__SVX_FREQ_RX__');
+
+// TX frequency; leave empty for simplex.
+define('FREQ_TX', '__SVX_FREQ_TX__');
+//==============================================================
+
+// ============================================================
+// SYSOP INFORMATION
+// ============================================================
+
+// System operator callsign
+$SYSOP = "__SVX_SYSOP__";
+
+// System operator name
+$SYSOPNAME = "__SVX_SYSOP_NAME__";
+
+// ============================================================
+// MISC
+// ============================================================
+
+// Default theme on page load: 'dark' or 'light'
+define('DEFAULT_THEME', 'dark');
+
+// Default interface language on first visit: 'en' or 'pl'
+// (a visitor's flag choice is remembered in the browser and overrides
+// this on later visits). Upstream default is 'pl'; this installer seeds
+// 'en' as the neutral default.
+define('DEFAULT_LANG', 'en');
+
+// CPU temperature offset (e.g. for Orange Pi Zero v1 LTS)
+define('CPU_TEMP_OFFSET', '0');
+
+// Logo path
+define('LOGO_PATH', 'images/logo.png');
+
+// Configuration file for SvxLink — the IN-CONTAINER path. The quadlet
+// bind-mounts the host's ~/.svxlink/etc/svxlink.conf here read-only.
+define('SVXLINK_CONFIG', '/etc/svxlink/svxlink.conf');
+
+// Log FILE for SvxLink — the IN-CONTAINER path, and it must be the
+// FILE, not the directory: unlike the CN8VX original (whose
+// resolveLogPath() also accepted a directory), the radioprj fork
+// fopen()s SVXLINK_LOG and SVXLINK_LOG.".1" directly everywhere
+// (tail_lines() on a directory dies with fread errno=21). The quadlet
+// bind-mounts the host's ~/.svxlink/log dir at /var/log/svxlink (ro);
+// this file plus its single ".1" rotation sibling are exactly what the
+// svxlink-server image's rotation contract produces.
+define('SVXLINK_LOG', '/var/log/svxlink/svxlink');
+
+// ========================================
+// CPU TEMPERATURE UNIT: 'C' or 'F'
+// ========================================
+// The color thresholds (index.php) ALWAYS operate on the Celsius value —
+// hw_cpuTemp()/live_cpuTemp() never convert it. This constant affects
+// ONLY what the visitor sees (the *_display fields below).
+define('TEMP_UNIT', 'C'); // 'F' e.g. for colleagues in the USA
+
+// Formats a temperature (Celsius, as a numeric string) for display in
+// the configured unit, degree symbol included. Deliberately very light —
+// also safe in hardware_live.php (a <10ms endpoint) which includes only
+// config.php, not the whole hardware_info.php.
+function formatTempDisplay(string $celsiusStr): string {
+    if ($celsiusStr === '' || !is_numeric($celsiusStr)) return '';
+    $c = (float) $celsiusStr;
+
+    if (TEMP_UNIT === 'F') {
+        $f = ($c * 9 / 5) + 32;
+        return number_format($f, 1) . '°F';
+    }
+    return number_format($c, 1) . '°C';
+}
+
+
+// ==============================================================
+// Timezone. The upstream file readlink()s /etc/localtime, which inside
+// the dashboard container reflects the IMAGE's zone (UTC), not the
+// host's — so the installer bakes the host zone in here at seed time
+// (from SVX_TZ / /etc/timezone). The readlink path stays as a fallback
+// for a hand-copied config with the placeholder left unfilled.
+// ==============================================================
+$svxTz = '__SVX_TZ__';
+if ($svxTz !== '' && strpos($svxTz, '__SVX_') !== 0
+        && in_array($svxTz, timezone_identifiers_list(), true)) {
+    date_default_timezone_set($svxTz);
+    define('TIMEZONE', $svxTz);
+} elseif (file_exists('/etc/localtime')
+        && ($systemTimezone = readlink('/etc/localtime')) !== false
+        && strpos($systemTimezone, 'zoneinfo/') !== false) {
+    $timezone = substr($systemTimezone, strpos($systemTimezone, 'zoneinfo/') + 9);
+    date_default_timezone_set($timezone);
+    define('TIMEZONE', $timezone);
+} else {
+    date_default_timezone_set('UTC');
+    define('TIMEZONE', 'UTC');
+}

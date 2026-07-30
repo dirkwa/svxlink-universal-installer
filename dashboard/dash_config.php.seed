@@ -1,0 +1,27 @@
+<?php
+/**
+ * dash_config.php — SvxLink Dashboard by CN8VX
+ *
+ * Shared window.DASH_CONFIG block, included identically on ALL pages
+ * (index.php, nodes.php, talkgroup.php, logsvx.php) — it must appear
+ * BEFORE <script src="scripts/i18n.js"> and <script src="scripts/main.js">.
+ * Requires include/config.php (DEFAULT_THEME / DEFAULT_LANG / TIMEZONE)
+ * to be loaded first — every page already guarantees that.
+ *
+ * Installer note: seeded to ~/.svxlink/dashboard/dash_config.php ONLY if
+ * absent, then operator-owned — edits survive every dashboard rebuild
+ * because the file is bind-mounted read-only over the baked copy. The
+ * values below are the upstream defaults at the pinned commit
+ * (docs/dashboard.md).
+ */
+?>
+<script>
+window.DASH_CONFIG = {
+    refresh:       8,
+    qrz_enabled:   true,
+    qrz_url:       'https://www.qrz.com/db/',
+    default_theme: '<?php echo htmlspecialchars(DEFAULT_THEME); ?>',
+    default_lang:  '<?php echo htmlspecialchars(DEFAULT_LANG); ?>',
+    timezone:      '<?php echo htmlspecialchars(TIMEZONE); ?>'
+};
+</script>
