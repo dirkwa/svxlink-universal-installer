@@ -1,0 +1,2497 @@
+#!/usr/bin/env bash
+# svx — user-facing CLI for the SvxLink container node.
+# Installed by svxlink-universal-installer.
+#
+# Usage:
+#   svx health              node health: unit + in-container process check,
+#                           log-file age (informational only — idle repeaters
+#                           are silent for hours), EchoLink directory state,
+#                           dashboard probe when installed
+#   svx update [--no-rollback] [--dashboard]
+#                           pull the channel tag from the live Quadlet's
+#                           Image= line, restart onto it, verify (unit +
+#                           process + log growth) and auto-roll back to the
+#                           previous digest when the verify fails.
+#                           --no-rollback opts out of the rollback;
+#                           --dashboard also rebuilds the local dashboard.
+#   svx channel [latest|master|<version>]
+#                           no argument: show the configured channel tag,
+#                           the resolved digests and the newest stable tag
+#                           on GHCR. With an argument: validate the tag,
+#                           rewrite Image= and run 'svx update' to apply.
+#   svx logs [-f] [--dashboard]
+#                           tail ~/.svxlink/log/svxlink (the authoritative
+#                           file log); -f follows across rotation.
+#                           --dashboard shows the dashboard container log.
+#   svx config [edit|show|set SECTION KEY VALUE [FILE]]
+#                           edit: pick svxlink.conf / a svxlink.d file /
+#                           node_info.json and open it in $EDITOR (default
+#                           nano), snapshot first, restart offer after.
+#                           set: scripted section-scoped INI edit.
+#   svx audio               interactive audio wizard: ALSA card picker
+#                           (stable CARD= names), PipeWire/Pulse conflict
+#                           handling, optional in-container loopback test
+#   svx ptt                 interactive PTT + squelch wizard: CM108 hidraw
+#                           (udev rule), serial RTS/DTR, Pi GPIO via gpiod,
+#                           or none/VOX-only
+#   svx sounds [list|install <lang> <url-or-tarball>|remove <lang>]
+#                           language-pack overrides in ~/.svxlink/sounds/,
+#                           mounted read-only over the image's baked packs
+#   svx render-server [--no-restart]
+#                           re-render the live svxlink-server Quadlet from
+#                           the staged template + hardware.json; restarts
+#                           only when the render changed the file
+#   svx dashboard [install [--image REF]|update|remove|status]
+#                           CN8VX web dashboard: source cloned at a pinned
+#                           commit, image built LOCALLY on this host (the
+#                           dashboard has no license — never pushed).
+#                           install --image REF uses a pre-built image from
+#                           local storage (build elsewhere, podman load here)
+#   svx restart             restart svxlink-server (+ dashboard if present)
+#   svx stop [--durable]    stop the node now; --durable also keeps it down
+#                           across reboots until 'svx start'
+#   svx start               start the node (also undoes a durable stop)
+#   svx recover [...]       delegate to ~/.local/bin/svx-recovery
+#                           (status | rollback-server | rollback-dashboard |
+#                           rollback-all | doctor) — zero containers needed
+#   svx resolv-watch [install|heal]
+#                           DNS self-heal units: recreate svxlink-server
+#                           when host DNS appeared only after the container
+#                           started (boot beat DHCP — EchoLink directory
+#                           login would stay dead until then)
+#   svx bug-report [--to DIR]
+#                           bundle logs + state into DIR (default: $HOME).
+#                           EchoLink PASSWORD values are redacted.
+#   svx self-update         refetch svx, svx-recovery and the staged payload
+#                           from GitHub Pages (SVX_INSTALLER_BASE overrides
+#                           the base URL, e.g. for a local e2e mirror)
+#   svx uninstall           stop units + remove Quadlets (preserves data)
+#   svx version             print installer version
+#   svx help                show this help
+
+set -euo pipefail
+
+SVX_VERSION="__SVX_VERSION__"
+
+# Third-party dashboard source, pinned to an exact commit. Unreviewed
+# third-party code must never float (the same ADR that digest-pins the
+# signalk stack's dbus-proxy): a newer pin arrives only via 'svx
+# self-update' replacing this constant. The radioprj fork keeps its
+# includes under include/ (config.php, dash_config.php, talkgroups.json,
+# cache_helper.php). The repo has NO license, which is why the image is
+# only ever built locally as localhost/svxlink-dashboard:local.
+DASHBOARD_REPO="https://github.com/radioprj/SvxLink-Dashboard-V4.0-by-CN8VX"
+DASHBOARD_PIN="d344a2c0b0887c5b51dd23e877e0689cd2458d4e"
+
+# Bootstrap/self-update base. SVX_INSTALLER_BASE is the env override both
+# install.sh and this script honor — required for local e2e against a
+# non-Pages mirror.
+DEFAULT_BASE="https://dirkwa.github.io/svxlink-universal-installer"
+
+DEFAULT_IMAGE="ghcr.io/dirkwa/svxlink-server:latest"
+
+SVX_HOME="${HOME}/.svxlink"
+ETC_DIR="${SVX_HOME}/etc"
+LOG_FILE="${SVX_HOME}/log/svxlink"
+HW_FILE="${SVX_HOME}/hardware.json"
+PAYLOAD_DIR="${SVX_HOME}/payload"
+SNAP_DIR="${SVX_HOME}/snapshots"
+LAST_GOOD="${SVX_HOME}/last-good.json"
+DASH_SRC="${SVX_HOME}/dashboard-src"
+DASH_STATE="${SVX_HOME}/dashboard"
+DASH_IMAGE="localhost/svxlink-dashboard:local"
+QUADLET_DIR="${HOME}/.config/containers/systemd"
+SERVER_QUADLET="${QUADLET_DIR}/svxlink-server.container"
+DASH_QUADLET="${QUADLET_DIR}/svxlink-dashboard.container"
+UDEV_RULE_FILE="/etc/udev/rules.d/99-svxlink-ptt.rules"
+
+# The dashboard quadlet is conditional (written only by 'svx dashboard
+# install'); every UNITS consumer below tolerates a missing unit (`|| true`
+# stops, status captures, quadlet rm -f), so listing it unconditionally is
+# safe and keeps uninstall + bug-report complete.
+UNITS=(svxlink-server svxlink-dashboard)
+
+# Files 'svx self-update' refetches from Pages, as repo-relative paths.
+# MUST stay a strict subset of install.sh's FETCH MANIFEST — the
+# check-installer-manifest.sh test parses both marker pairs and asserts it.
+# BEGIN SELFUPDATE MANIFEST
+SELFUPDATE_FILES=(
+    "installer/linux/svx.tmpl"
+    "installer/linux/svx-recovery.tmpl"
+    "installer/linux/render-server-quadlet.sh"
+    "installer/linux/detect-hardware.sh"
+    "installer/linux/seed-config.sh"
+    "installer/linux/lib/colors.sh"
+    "installer/linux/lib/distro.sh"
+    "installer/linux/lib/http.sh"
+    "installer/linux/lib/ghcr.sh"
+    "installer/linux/lib/hardware-merge.sh"
+    "installer/linux/lib/udev-rule.sh"
+    "quadlets/svxlink-server.container.template"
+    "quadlets/svxlink-dashboard.container.template"
+    "dashboard/Containerfile"
+    "dashboard/config.php.tmpl"
+    "dashboard/dash_config.php.seed"
+    "dashboard/talkgroups.json.seed"
+)
+# END SELFUPDATE MANIFEST
+
+info() { echo "[i] $*"; }
+ok()   { echo "[OK] $*"; }
+warn() { echo "[WARN] $*" >&2; }
+err()  { echo "[ERR] $*" >&2; }
+die()  { err "$@"; exit 1; }
+
+usage() {
+    # Print the leading comment block (from line 2 up to the first
+    # non-comment line — the `set -euo pipefail` that ends the header) as the
+    # help text. Keying on "stop at the first non-# line" rather than a fixed
+    # line range means adding a help entry never silently truncates the
+    # output. (Ported from the signalk CLI; no platform filtering here —
+    # this stack is Linux-only.)
+    sed -n '2,${/^#/!q;p}' "$0" | sed 's/^# \{0,1\}//'
+}
+
+cmd_version() {
+    echo "svx $SVX_VERSION"
+}
+
+# Resolve the server image at RUN time from the live Quadlet's Image= line
+# rather than baking it in: the tag is the operator's channel-of-record
+# ('svx channel' rewrites it) and self-update rewrites this script
+# byte-for-byte from Pages, where only __SVX_VERSION__ is substituted — a
+# baked image constant would silently revert the operator's channel choice
+# (the signalk __SK_HTTP_PORT__ lesson).
+svx_image() {
+    local p
+    # `|| true`: a missing Quadlet makes sed exit non-zero under pipefail.
+    p=$(sed -n 's/^Image=//p' "$SERVER_QUADLET" 2>/dev/null | head -1 || true)
+    printf '%s' "${p:-$DEFAULT_IMAGE}"
+}
+
+# Strip a ref down to the repository part (no tag, no digest). GHCR refs
+# here never carry a registry port, so "everything after the last colon in
+# the final path segment" is safe to treat as the tag.
+svx_image_base() {
+    local img="$1"
+    img="${img%%@*}"
+    case "${img##*/}" in
+        *:*) img="${img%:*}" ;;
+    esac
+    printf '%s' "$img"
+}
+
+svx_image_tag() {
+    local img="$1"
+    case "$img" in
+        *@*) printf 'digest-pinned'; return 0 ;;
+    esac
+    case "${img##*/}" in
+        *:*) printf '%s' "${img##*:}" ;;
+        *)   printf 'latest' ;;
+    esac
+}
+
+# Dashboard port/bind read live from the rendered quadlet
+# (PublishPort=<bind>:<port>:80) so a later re-render keeps the choice.
+svx_dash_port() {
+    local p
+    p=$(sed -n 's/^PublishPort=.*:\([0-9][0-9]*\):80$/\1/p' "$DASH_QUADLET" 2>/dev/null | head -1 || true)
+    printf '%s' "${p:-8080}"
+}
+
+svx_dash_bind() {
+    local b
+    b=$(sed -n 's/^PublishPort=\(.*\):[0-9][0-9]*:80$/\1/p' "$DASH_QUADLET" 2>/dev/null | head -1 || true)
+    printf '%s' "${b:-0.0.0.0}"
+}
+
+dashboard_installed() {
+    [[ -f "$DASH_QUADLET" ]]
+}
+
+# cp -p FILE into the snapshot dir under <UTC-ts>-<basename> before any
+# overwrite/edit — same discipline as the installer's snapshot_existing().
+# Returns non-zero if the copy fails so callers can refuse to proceed
+# without a backup.
+snapshot_file() {
+    local src=$1
+    [[ -f "$src" ]] || return 0
+    mkdir -p "$SNAP_DIR"
+    local ts
+    ts=$(date -u +"%Y%m%dT%H%M%SZ")
+    cp -p "$src" "$SNAP_DIR/${ts}-$(basename "$src")"
+}
+
+# Capture a failed unit's status + recent logs to stderr, indented.
+# `podman logs` is the authoritative source, not `journalctl --user -u`:
+# rootless podman/conmon writes the container's stdout/stderr to the journal
+# under the CONTAINER identifier, which `journalctl --user -u <quadlet-unit>`
+# does NOT surface — on a typical Pi it returns "No journal files were found"
+# even with a persistent journal, so the actual svxlink startup output (the
+# thing needed when a start times out) was invisible. The unit name maps 1:1
+# to the container name (ContainerName=<unit-without-.service>). The journal
+# line stays too — harmless, and occasionally carries systemd-side detail.
+capture_unit_failure() {
+    local unit=$1
+    local ctr="${unit%.service}"
+    {
+        echo "--- systemctl --user status \"$unit\" ---"
+        systemctl --user --no-pager --full status "$unit" 2>&1 || true
+        echo
+        echo "--- podman logs --tail 50 \"$ctr\" ---"
+        podman logs --tail 50 "$ctr" 2>&1 || true
+        echo
+        echo "--- journalctl --user -n 50 -u \"$unit\" ---"
+        journalctl --user --no-pager -n 50 -u "$unit" 2>&1 || true
+    } | sed 's/^/    /' >&2
+}
+
+# A `systemctl --user restart` of a Type=notify (sdnotify=conmon) unit
+# BLOCKS until conmon signals ready or TimeoutStartSec elapses, then returns
+# non-zero on timeout. But non-zero != "down": on an SD-card host the
+# `podman run --replace` create can exceed the timeout, systemd KILLs it,
+# and Restart=always silently retries — a later attempt succeeds in seconds.
+# This polls the unit for a grace window so that transient, self-recovering
+# case isn't reported as a failure. Returns 0 as soon as the unit is
+# `active`; short-circuits to 1 the moment it reaches `failed` (start-limit
+# hit — Restart=always won't retry from there, so waiting longer is
+# pointless). `is-active` is non-blocking, so the loop never hangs.
+unit_recovered_within() {
+    local unit=$1 secs=$2
+    local start=$SECONDS active
+    while (( SECONDS - start < secs )); do
+        active=$(systemctl --user is-active "$unit" 2>/dev/null || true)
+        if [[ "$active" == "active" ]]; then
+            return 0
+        elif [[ "$active" == "failed" ]]; then
+            return 1
+        fi
+        sleep 3
+    done
+    return 1
+}
+
+# A start that times out with no crashloop is, on SD-card hosts especially,
+# almost always podman blocking on a DAMAGED or INCOMPLETE overlay layer —
+# an interrupted pull leaves a layer `podman run` can't mount, conmon never
+# signals ready, systemd kills at TimeoutStartSec. `podman system check
+# --quick` reports this without mutating anything. We do NOT auto-repair:
+# rewriting the rootless store unprompted is riskier than telling the
+# operator what to run. Call sites need `|| true` under set -e.
+warn_if_storage_damaged() {
+    command -v podman >/dev/null 2>&1 || return 0
+    local report
+    report=$(podman system check --quick 2>&1) || true
+    if printf '%s' "$report" | grep -qiE 'damaged layer|incomplete layer|layer content modified'; then
+        warn "podman's image store has damaged/incomplete layers — the usual cause of"
+        warn "a start that times out without crash-looping (interrupted pull on slow"
+        warn "SD storage). Recover with:"
+        warn "    systemctl --user stop svxlink-server svxlink-dashboard"
+        warn "    podman system check --repair && podman system prune -f"
+        warn "    podman pull $(svx_image)"
+        warn "    systemctl --user start svxlink-server"
+        return 0
+    fi
+    return 1
+}
+
+# Reclaim dangling (<none>) layers. Rolling :latest/:master re-pulls orphan
+# the prior digest's layers; across enough updates the rootless store bloats
+# and on slow SD/eMMC the per-layer commit under the store lock makes
+# `podman pull` appear to hang. Dangling-only is safe — it never touches an
+# image a container references, so the rollback image always survives
+# (never `-a`).
+prune_dangling() {
+    if [[ -n "$(podman images -f dangling=true -q 2>/dev/null)" ]]; then
+        info "reclaiming dangling image layers"
+        podman image prune -f >/dev/null 2>&1 || true
+    fi
+}
+
+# Bounded pull. A stalled pull (slow store, registry hiccup) would otherwise
+# hang forever; `timeout` exits 124 on expiry, --retry covers transient
+# registry failures (they do NOT shorten a slow-but-progressing pull — that
+# is what the timeout bounds). Distinct recipes for timeout vs plain failure.
+bounded_pull() {
+    local img=$1 pull_rc=0
+    info "pulling $img"
+    timeout 900 podman pull --retry 3 --retry-delay 5s "$img" || pull_rc=$?
+    if [[ "$pull_rc" -eq 124 ]]; then
+        err "pulling $img did not finish within 900s."
+        err "On a Pi this is usually a bloated rootless store on slow SD storage."
+        err "Check and reclaim with:"
+        err "    podman system df"
+        err "    podman image prune -a -f   # then retry"
+        err "If the store is small, the registry path may be at fault — retry, or:"
+        err "    podman pull --log-level=debug $img"
+        return 1
+    elif [[ "$pull_rc" -ne 0 ]]; then
+        err "pulling $img failed (podman exit $pull_rc). Retry, or for detail:"
+        err "    podman pull --log-level=debug $img"
+        return 1
+    fi
+    return 0
+}
+
+# Log-liveness primitives. svxlink has no HTTP surface, so "the file log
+# grew after a restart" is THE health primitive. Track inode + size: a
+# rotation (mv -> .1 + reopen) right after a restart replaces the inode and
+# resets the size below the baseline while the log is very much alive — a
+# size-only compare would call that dead.
+log_stat() {
+    stat -c '%i %s' "$LOG_FILE" 2>/dev/null || echo "0 0"
+}
+
+wait_log_growth() {
+    local base_inode=$1 base_size=$2 secs=$3
+    local start=$SECONDS cur inode size
+    while (( SECONDS - start < secs )); do
+        cur=$(log_stat)
+        inode=${cur% *}
+        size=${cur#* }
+        if [[ "$inode" != "$base_inode" && "$size" -gt 0 ]]; then
+            return 0
+        fi
+        if (( size > base_size )); then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+wait_for_http() {
+    # Local minimal probe (the payload's lib/http.sh equivalent) so the CLI
+    # works even when the staged payload is missing/stale.
+    local url=$1 secs=${2:-60} i
+    for ((i = 0; i < secs; i++)); do
+        if curl -fsS -m 3 -o /dev/null "$url" 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+_fmt_age() {
+    local s=$1
+    if (( s < 120 )); then printf '%ss' "$s"
+    elif (( s < 7200 )); then printf '%s min' "$(( s / 60 ))"
+    else printf '%s h %s min' "$(( s / 3600 ))" "$(( (s % 3600) / 60 ))"
+    fi
+}
+
+# Direct systemctl restart with the slow-start tolerance. There is no
+# updater REST API in this stack — the CLI owns lifecycle (ADR: no engine
+# containers).
+_svx_restart_server() {
+    systemctl --user restart svxlink-server.service 2>/dev/null || true
+    if unit_recovered_within svxlink-server.service 120; then
+        ok "svxlink-server restarted."
+        return 0
+    fi
+    err "svxlink-server failed to come back after the restart:"
+    capture_unit_failure svxlink-server.service
+    warn_if_storage_damaged || true
+    return 1
+}
+
+offer_restart() {
+    # Non-interactive callers (scripts, the oneshot units) must never hang
+    # on read; print the command instead.
+    if [[ ! -t 0 ]]; then
+        echo "[i] Apply with: svx restart"
+        return 0
+    fi
+    local ans
+    if ! read -r -p "Restart svxlink-server now to apply? [Y/n] " ans; then
+        ans=""
+    fi
+    ans=${ans:-Y}
+    if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+        echo "[i] Later: svx restart"
+        return 0
+    fi
+    _svx_restart_server
+}
+
+seed_set() {
+    # Single-owner INI editing: always the staged seed-config.sh (shared
+    # with install.sh and the tests) — never a second sed implementation
+    # that could drift.
+    [[ -f "$PAYLOAD_DIR/seed-config.sh" ]] \
+        || die "payload missing (seed-config.sh) — run 'svx self-update' first"
+    bash "$PAYLOAD_DIR/seed-config.sh" set "$@"
+}
+
+# Regenerate the SANITIZED ModuleEchoLink.conf copy the dashboard mounts.
+# The real svxlink.d/ holds the plaintext EchoLink PASSWORD and stays 0700 +
+# outside the dashboard container entirely; the dashboard reads a copy with
+# the PASSWORD value replaced by REDACTED. Regenerated after every config
+# touch of that file so the copy can never go stale — but only when the
+# dashboard state dir exists (no dashboard, no copy to maintain).
+refresh_dashboard_echolink_copy() {
+    [[ -d "$DASH_STATE" ]] || return 0
+    if [[ ! -f "$ETC_DIR/svxlink.d/ModuleEchoLink.conf" ]]; then
+        # The quadlet ro-binds the copy; a missing bind SOURCE fails
+        # container create with exit 125, so keep an (empty) file in place.
+        [[ -f "$DASH_STATE/ModuleEchoLink.conf" ]] || : >"$DASH_STATE/ModuleEchoLink.conf"
+        return 0
+    fi
+    [[ -f "$PAYLOAD_DIR/seed-config.sh" ]] || return 0
+    bash "$PAYLOAD_DIR/seed-config.sh" sanitize-echolink \
+        "$ETC_DIR/svxlink.d/ModuleEchoLink.conf" \
+        "$DASH_STATE/ModuleEchoLink.conf" \
+        || warn "could not refresh the sanitized dashboard EchoLink config"
+}
+
+# --- last-good.json ---------------------------------------------------------
+# Rollback anchor + verify record. jq preferred; the jq-less floor rebuilds
+# the object from the keys this file owns (bootstrappedAt is preserved — it
+# is the installer's VERIFY_MODE key and must survive every update).
+_lg_get() {
+    sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$LAST_GOOD" 2>/dev/null | head -1 || true
+}
+
+lastgood_set() {
+    local key=$1 val=$2 tmp
+    mkdir -p "$SVX_HOME"
+    tmp=$(mktemp "${LAST_GOOD}.XXXXXX") || return 1
+    if command -v jq >/dev/null 2>&1 && [[ -s "$LAST_GOOD" ]] \
+        && jq --arg k "$key" --arg v "$val" '.[$k] = $v' "$LAST_GOOD" >"$tmp" 2>/dev/null; then
+        :
+    else
+        # Floor: re-emit the known keys with the one override applied.
+        local boot prev good tag upd
+        boot=$(_lg_get bootstrappedAt)
+        prev=$(_lg_get previousImage)
+        good=$(_lg_get lastGoodImage)
+        tag=$(_lg_get lastGoodTag)
+        upd=$(_lg_get updatedAt)
+        case "$key" in
+            bootstrappedAt) boot=$val ;;
+            previousImage)  prev=$val ;;
+            lastGoodImage)  good=$val ;;
+            lastGoodTag)    tag=$val ;;
+            updatedAt)      upd=$val ;;
+        esac
+        printf '{\n  "bootstrappedAt": "%s",\n  "previousImage": "%s",\n  "lastGoodImage": "%s",\n  "lastGoodTag": "%s",\n  "updatedAt": "%s"\n}\n' \
+            "$boot" "$prev" "$good" "$tag" "$upd" >"$tmp"
+    fi
+    chmod 0644 "$tmp" && mv -f "$tmp" "$LAST_GOOD"
+}
+
+# Rewrite the live Quadlet's (single) Image= line. The value travels via
+# ENVIRON[] rather than a sed program so a digest ref or any future
+# sed-special character can't corrupt the program text. Snapshots first;
+# refuses when the live file has no Image= line at all (a malformed file we
+# must not "fix" blindly).
+splice_live_image() {
+    local new_ref=$1
+    [[ -f "$SERVER_QUADLET" ]] || { err "no live Quadlet at $SERVER_QUADLET"; return 1; }
+    grep -q '^Image=' "$SERVER_QUADLET" \
+        || { err "live Quadlet has no Image= line — refusing to splice"; return 1; }
+    snapshot_file "$SERVER_QUADLET" \
+        || { err "could not snapshot the Quadlet — refusing to rewrite without a backup"; return 1; }
+    local tmp
+    tmp=$(mktemp "${SERVER_QUADLET}.XXXXXX") || return 1
+    if ! NEW_IMAGE="Image=${new_ref}" awk '
+        !done && /^Image=/ { print ENVIRON["NEW_IMAGE"]; done = 1; next }
+        { print }
+    ' "$SERVER_QUADLET" >"$tmp" || ! chmod 0644 "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$SERVER_QUADLET"
+}
+
+# One-line reason describing how the running container differs from the
+# configured image, or empty when they match. Truth source is the RUNNING
+# container (resolved image ID), not Quadlet text — file diffs are noisy.
+# Checked in order: container missing -> state != running -> ImageName
+# mismatch -> resolved image ID mismatch (a rolling tag whose digest moved
+# under a stable name — the case a string compare can never catch).
+svx_drift_reason() {
+    local img=$1
+    podman container exists svxlink-server 2>/dev/null || { echo "container missing"; return 0; }
+    local state
+    state=$(podman inspect svxlink-server --format '{{.State.Status}}' 2>/dev/null || echo unknown)
+    if [[ "$state" != "running" ]]; then
+        echo "container state=$state"
+        return 0
+    fi
+    local run_image
+    run_image=$(podman inspect svxlink-server --format '{{.ImageName}}' 2>/dev/null || true)
+    if [[ -n "$run_image" && "$run_image" != "$img" ]]; then
+        echo "image: running=$run_image configured=$img"
+        return 0
+    fi
+    local run_id pulled_id
+    run_id=$(podman inspect svxlink-server --format '{{.Image}}' 2>/dev/null || true)
+    pulled_id=$(podman image inspect "$img" --format '{{.Id}}' 2>/dev/null || true)
+    if [[ -n "$run_id" && -n "$pulled_id" && "$run_id" != "$pulled_id" ]]; then
+        echo "image digest: running=${run_id:0:19} pulled=${pulled_id:0:19}"
+        return 0
+    fi
+    echo ""
+}
+
+# Channel-label guard: the image contract labels every published image with
+# org.svxlink.image.channel (latest|master|manual). For the rolling channel
+# tags this must match the tag the quadlet asks for — it catches hand-retag
+# mistakes (someone pushed a :master build as :latest, or retagged locally)
+# before we restart a repeater onto it. Pinned versions and digest pins are
+# exempt: their identity IS the pin.
+guard_channel_label() {
+    local img=$1 tag label
+    tag=$(svx_image_tag "$img")
+    case "$tag" in
+        latest|master) ;;
+        *) return 0 ;;
+    esac
+    label=$(podman image inspect "$img" \
+        --format '{{index .Config.Labels "org.svxlink.image.channel"}}' 2>/dev/null || true)
+    if [[ -z "$label" || "$label" == "<no value>" ]]; then
+        # Pre-contract or hand-built image: warn, don't block — the operator
+        # may be running a local build on purpose.
+        warn "image carries no org.svxlink.image.channel label — cannot verify the channel"
+        return 0
+    fi
+    if [[ "$label" != "$tag" ]]; then
+        err "channel mismatch: the Quadlet asks for ':$tag' but the pulled image is"
+        err "labelled channel='$label'. Refusing to restart onto it — this usually"
+        err "means a mis-tagged push or a local retag. Inspect with:"
+        err "    podman image inspect $img --format '{{.Config.Labels}}'"
+        return 1
+    fi
+    return 0
+}
+
+cmd_health() {
+    echo "=== SvxLink Node Health ==="
+    if systemctl --user is-active --quiet svxlink-server.service 2>/dev/null; then
+        printf '  [OK]   svxlink-server.service is active\n'
+    else
+        printf '  [FAIL] svxlink-server.service is not active\n'
+    fi
+    if podman exec svxlink-server pgrep -x svxlink >/dev/null 2>&1; then
+        printf '  [OK]   svxlink process running in the container\n'
+    else
+        printf '  [FAIL] no svxlink process in the container (or container not running)\n'
+    fi
+    # Log-file age is INFORMATIONAL ONLY, never a failure: idle repeaters
+    # legitimately log nothing for hours (image-contract stance; making this
+    # a FAIL would flap every quiet night on a rural repeater).
+    if [[ -f "$LOG_FILE" ]]; then
+        local mtime age
+        mtime=$(stat -c %Y "$LOG_FILE" 2>/dev/null || echo 0)
+        age=$(( $(date +%s) - mtime ))
+        printf '  [INFO] last log activity: %s ago (%s)\n' "$(_fmt_age "$age")" "$LOG_FILE"
+    else
+        printf '  [INFO] no log file yet at %s\n' "$LOG_FILE"
+    fi
+    # EchoLink directory state, log-derived (svxlink has no status API).
+    local el
+    el=$(tail -n 400 "$LOG_FILE" 2>/dev/null | grep -E '### EchoLink|Selecting' | tail -1 || true)
+    if [[ -n "$el" ]]; then
+        printf '  [INFO] EchoLink: %s\n' "$el"
+    else
+        printf '  [INFO] EchoLink: no directory activity in the recent log\n'
+    fi
+    if dashboard_installed; then
+        local port
+        port=$(svx_dash_port)
+        if systemctl --user is-active --quiet svxlink-dashboard.service 2>/dev/null; then
+            printf '  [OK]   svxlink-dashboard.service is active\n'
+        else
+            printf '  [FAIL] svxlink-dashboard.service is not active\n'
+        fi
+        if curl -fsS -m 3 -o /dev/null "http://127.0.0.1:${port}/" 2>/dev/null; then
+            printf '  [OK]   dashboard answers on http://127.0.0.1:%s/\n' "$port"
+        else
+            printf '  [FAIL] dashboard does not answer on http://127.0.0.1:%s/\n' "$port"
+        fi
+    fi
+
+    echo
+    echo "=== systemd-user units ==="
+    systemctl --user --no-pager list-units --all 'svxlink-*' 2>/dev/null || true
+
+    echo
+    echo "=== Container snapshot ==="
+    podman ps -a --filter 'name=svxlink-' \
+        --format '{{.Names}}  {{.Status}}  {{.Image}}' 2>/dev/null || true
+}
+
+cmd_update() {
+    local do_rollback=true do_dashboard=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-rollback) do_rollback=false; shift ;;
+            --dashboard)   do_dashboard=true; shift ;;
+            *) err "Unknown update argument: $1"; return 1 ;;
+        esac
+    done
+    [[ -f "$SERVER_QUADLET" ]] \
+        || die "no live Quadlet at $SERVER_QUADLET — run the installer first"
+
+    local image
+    image=$(svx_image)
+    info "channel image (from the live Quadlet): $image"
+
+    prune_dangling
+    bounded_pull "$image" || exit 1
+    guard_channel_label "$image" || exit 1
+
+    local reason
+    reason=$(svx_drift_reason "$image")
+    if [[ -z "$reason" ]]; then
+        ok "already up to date — running the current $image."
+        # Ambient re-verify: unit + process only. NEVER log growth here — an
+        # idle node writes nothing and this is not a restart.
+        if ! systemctl --user is-active --quiet svxlink-server.service \
+            || ! podman exec svxlink-server pgrep -x svxlink >/dev/null 2>&1; then
+            warn "up to date, but the node looks unhealthy — see 'svx health'"
+        fi
+        if [[ "$do_dashboard" == true ]]; then
+            cmd_dashboard update
+        fi
+        return 0
+    fi
+    info "restart needed ($reason)"
+
+    # Rollback anchor: the digest of the image the container is CURRENTLY
+    # running, recorded BEFORE anything is touched. Digest-pinned on purpose
+    # — after a rollback the rolling tag would just re-drift on the next
+    # pull; the pin stays until the operator runs 'svx channel latest'.
+    local prev_image=""
+    if podman container exists svxlink-server 2>/dev/null; then
+        local prev_digest
+        prev_digest=$(podman inspect svxlink-server --format '{{.ImageDigest}}' 2>/dev/null || true)
+        if [[ -n "$prev_digest" ]]; then
+            prev_image="$(svx_image_base "$image")@${prev_digest}"
+        fi
+    fi
+    if [[ -n "$prev_image" ]]; then
+        lastgood_set previousImage "$prev_image" \
+            || warn "could not record the rollback anchor in $LAST_GOOD"
+    else
+        warn "no running container to anchor a rollback to — auto-rollback disabled for this run"
+        do_rollback=false
+    fi
+
+    # Snapshot unconditionally: a :latest/:master update doesn't rewrite the
+    # Quadlet, but a pinned-version switch via 'svx channel' does, and one
+    # cp -p is cheap insurance either way.
+    snapshot_file "$SERVER_QUADLET" \
+        || die "could not snapshot the Quadlet — refusing to restart without a backup"
+
+    local base_stat base_inode base_size
+    base_stat=$(log_stat)
+    base_inode=${base_stat% *}
+    base_size=${base_stat#* }
+
+    systemctl --user daemon-reload || true
+    systemctl --user restart svxlink-server.service 2>/dev/null || true
+
+    if unit_recovered_within svxlink-server.service 120 \
+        && wait_log_growth "$base_inode" "$base_size" 60 \
+        && podman exec svxlink-server pgrep -x svxlink >/dev/null 2>&1; then
+        local new_digest
+        new_digest=$(podman inspect svxlink-server --format '{{.ImageDigest}}' 2>/dev/null || true)
+        if [[ -n "$new_digest" ]]; then
+            lastgood_set lastGoodImage "$(svx_image_base "$image")@${new_digest}" || true
+        fi
+        lastgood_set lastGoodTag "$(svx_image_tag "$image")" || true
+        lastgood_set updatedAt "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" || true
+        prune_dangling
+        ok "update complete — running $image"
+        if [[ "$do_dashboard" == true ]]; then
+            cmd_dashboard update
+        fi
+        return 0
+    fi
+
+    err "update verify FAILED (unit/process/log-growth):"
+    capture_unit_failure svxlink-server.service
+    warn_if_storage_damaged || true
+
+    if [[ "$do_rollback" != true || -z "$prev_image" ]]; then
+        err "auto-rollback is disabled — recover manually:"
+        err "    svx recover status ; svx recover rollback-server"
+        err "    svx bug-report"
+        exit 1
+    fi
+
+    echo
+    info "rolling back to the last-good image: $prev_image"
+    splice_live_image "$prev_image" || {
+        err "could not rewrite Image= for the rollback — see 'svx recover'"
+        exit 1
+    }
+    systemctl --user daemon-reload || true
+    base_stat=$(log_stat)
+    base_inode=${base_stat% *}
+    base_size=${base_stat#* }
+    systemctl --user restart svxlink-server.service 2>/dev/null || true
+    if unit_recovered_within svxlink-server.service 120 \
+        && wait_log_growth "$base_inode" "$base_size" 60 \
+        && podman exec svxlink-server pgrep -x svxlink >/dev/null 2>&1; then
+        echo
+        echo "[ROLLED BACK] The update failed verification and svxlink-server is now"
+        echo "  PINNED to the last-good digest:"
+        echo "    $prev_image"
+        echo "  This pin is deliberately sticky (a rolling tag would re-drift on the"
+        echo "  next update). After investigating, return to the channel with:"
+        echo "    svx channel latest"
+        exit 1
+    fi
+    err "rollback did NOT recover the node either. Next steps:"
+    err "    svx recover status ; svx recover rollback-server ; svx recover doctor"
+    err "    svx bug-report"
+    exit 1
+}
+
+cmd_channel() {
+    local arg="${1:-}"
+    [[ -f "$SERVER_QUADLET" ]] \
+        || die "no live Quadlet at $SERVER_QUADLET — run the installer first"
+    local image base tag repo
+    image=$(svx_image)
+    base=$(svx_image_base "$image")
+    tag=$(svx_image_tag "$image")
+    repo=${base#ghcr.io/}
+
+    if [[ -z "$arg" ]]; then
+        local pulled running
+        pulled=$(podman image inspect "$image" --format '{{index .RepoDigests 0}}' 2>/dev/null || true)
+        running=$(podman inspect svxlink-server --format '{{.ImageDigest}}' 2>/dev/null || true)
+        echo "Channel (Image= tag):  $tag"
+        echo "Image:                 $image"
+        echo "Pulled digest:         ${pulled:-(not pulled)}"
+        echo "Running digest:        ${running:-(not running)}"
+        # LatestAvailable via the payload's live GHCR helper (anonymous v2
+        # token — public images need no auth).
+        if [[ -f "$PAYLOAD_DIR/lib/ghcr.sh" ]]; then
+            # shellcheck disable=SC1090,SC1091
+            . "$PAYLOAD_DIR/lib/ghcr.sh"
+            if declare -F latest_stable_tag >/dev/null 2>&1; then
+                echo "Newest stable on GHCR: $(latest_stable_tag "$repo")"
+            fi
+        fi
+        return 0
+    fi
+
+    case "$arg" in
+        latest|master) ;;
+        *)
+            # Validate a pinned version against GHCR before splicing it into
+            # the Quadlet — a typo'd tag would otherwise only surface as a
+            # failed pull inside 'svx update'. ONLY for ghcr.io-hosted repos:
+            # lib/ghcr.sh speaks the GHCR token API, and blindly prefixing
+            # ghcr.io/ onto a custom SVX_IMAGE_REPO (mirror, LAN registry —
+            # the e2e harness rig) produced a nonsense URL that hard-refused
+            # every valid tag. Non-GHCR registries skip pre-validation and
+            # let the pull decide.
+            if [[ "$base" == ghcr.io/* ]]; then
+                if [[ -f "$PAYLOAD_DIR/lib/ghcr.sh" ]]; then
+                    # shellcheck disable=SC1090,SC1091
+                    . "$PAYLOAD_DIR/lib/ghcr.sh"
+                fi
+                if declare -F tag_exists >/dev/null 2>&1; then
+                    tag_exists "$repo" "$arg" \
+                        || die "tag '$arg' not found on ghcr.io/$repo — see the tags list on GHCR"
+                else
+                    warn "cannot validate the tag (payload lib/ghcr.sh missing tag_exists);"
+                    warn "a bad tag will fail at the pull step of 'svx update'"
+                fi
+            else
+                warn "non-GHCR registry ($base) — skipping tag pre-validation;"
+                warn "a bad tag will fail at the pull step of 'svx update'"
+            fi
+            ;;
+    esac
+
+    splice_live_image "${base}:${arg}" || exit 1
+    systemctl --user daemon-reload || true
+    ok "channel set to :$arg — applying with 'svx update'..."
+    cmd_update
+}
+
+cmd_logs() {
+    local follow=false dash=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--follow)  follow=true; shift ;;
+            --dashboard)  dash=true; shift ;;
+            *) err "Unknown logs argument: $1"; return 1 ;;
+        esac
+    done
+    if [[ "$dash" == true ]]; then
+        if [[ "$follow" == true ]]; then
+            exec podman logs -f svxlink-dashboard
+        fi
+        exec podman logs --tail 200 svxlink-dashboard
+    fi
+    [[ -f "$LOG_FILE" ]] || die "no log file yet at $LOG_FILE — is svxlink-server running?"
+    if [[ "$follow" == true ]]; then
+        # -F = --follow=name --retry: keeps following THE NAME across the
+        # entrypoint's rotation (mv -> .1 + reopen), where plain -f would
+        # silently keep reading the renamed old file.
+        exec tail -n 50 -F "$LOG_FILE"
+    fi
+    tail -n 100 "$LOG_FILE"
+    echo
+    echo "[i] 'podman logs svxlink-server' shows the same stream (the entrypoint"
+    echo "    mirrors the file to stdout); 'svx logs -f' follows across rotation."
+}
+
+cmd_config() {
+    local sub="${1:-show}"
+    if [[ $# -gt 0 ]]; then shift; fi
+    case "$sub" in
+        show)
+            [[ -f "$ETC_DIR/svxlink.conf" ]] || die "no config at $ETC_DIR — run the installer first"
+            echo "# $ETC_DIR/svxlink.conf"
+            cat "$ETC_DIR/svxlink.conf"
+            echo
+            echo "# Files under $ETC_DIR/svxlink.d/:"
+            ls -1 "$ETC_DIR/svxlink.d" 2>/dev/null || echo "(none)"
+            ;;
+        edit)
+            [[ -t 0 ]] || die "config edit is interactive; scripted path: svx config set SECTION KEY VALUE [FILE]"
+            local files=() f
+            [[ -f "$ETC_DIR/svxlink.conf" ]] && files+=("$ETC_DIR/svxlink.conf")
+            for f in "$ETC_DIR"/svxlink.d/*.conf; do
+                [[ -f "$f" ]] && files+=("$f")
+            done
+            [[ -f "$ETC_DIR/node_info.json" ]] && files+=("$ETC_DIR/node_info.json")
+            (( ${#files[@]} > 0 )) || die "no config files under $ETC_DIR — run the installer first"
+            echo "Which file?"
+            local i
+            for i in "${!files[@]}"; do
+                printf '  %2d) %s\n' "$((i + 1))" "${files[$i]#"$SVX_HOME"/}"
+            done
+            local pick
+            if ! read -r -p "File [1]: " pick; then pick=""; fi
+            pick=${pick:-1}
+            if [[ ! "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > ${#files[@]} )); then
+                die "invalid selection: $pick"
+            fi
+            f="${files[$((pick - 1))]}"
+            snapshot_file "$f" \
+                || die "could not snapshot $f — refusing to edit without a backup"
+            "${EDITOR:-nano}" "$f"
+            if [[ "$f" == "$ETC_DIR/svxlink.d/ModuleEchoLink.conf" ]]; then
+                refresh_dashboard_echolink_copy
+            fi
+            offer_restart
+            ;;
+        set)
+            (( $# >= 3 )) || die "usage: svx config set SECTION KEY VALUE [FILE]"
+            local section=$1 key=$2 value=$3 file="${4:-$ETC_DIR/svxlink.conf}"
+            # Accept a bare filename relative to etc/ or svxlink.d/ for
+            # convenience ("svx config set ... ModuleEchoLink.conf").
+            if [[ "$file" != /* ]]; then
+                if [[ -f "$ETC_DIR/$file" ]]; then
+                    file="$ETC_DIR/$file"
+                elif [[ -f "$ETC_DIR/svxlink.d/$file" ]]; then
+                    file="$ETC_DIR/svxlink.d/$file"
+                fi
+            fi
+            [[ -f "$file" ]] || die "config file not found: $file"
+            snapshot_file "$file" \
+                || die "could not snapshot $file — refusing to edit without a backup"
+            seed_set "$file" "$section" "$key" "$value"
+            ok "set [$section] $key in ${file#"$SVX_HOME"/}"
+            if [[ "$file" == */ModuleEchoLink.conf ]]; then
+                refresh_dashboard_echolink_copy
+            fi
+            echo "[i] Apply with: svx restart"
+            ;;
+        *)
+            err "Unknown config subcommand: $sub (use edit|show|set)"
+            return 1
+            ;;
+    esac
+}
+
+# --- hardware.json plumbing -------------------------------------------------
+# Detection re-emits fresh defaults; hardware_merge (staged jq filter,
+# shared with the tests) carries operator choices forward with explicit
+# has() checks — `//` would resurrect a stored `false`. The wizard's own
+# result is then assigned on top as OperatorIntent.
+hw_base_json() {
+    local old fresh
+    old=$(cat "$HW_FILE" 2>/dev/null || echo '{}')
+    fresh=""
+    if [[ -f "$PAYLOAD_DIR/detect-hardware.sh" ]]; then
+        fresh=$(bash "$PAYLOAD_DIR/detect-hardware.sh" 2>/dev/null || true)
+    fi
+    if [[ -n "$fresh" && -f "$PAYLOAD_DIR/lib/hardware-merge.sh" ]]; then
+        # shellcheck disable=SC1090,SC1091
+        . "$PAYLOAD_DIR/lib/hardware-merge.sh"
+        if declare -F hardware_merge >/dev/null 2>&1; then
+            hardware_merge "$old" "$fresh" 2>/dev/null && return 0
+        fi
+    fi
+    printf '%s' "$old"
+}
+
+hw_set() {
+    # $1 = top-level key to assign, $2 = JSON value. Atomic write — a
+    # half-written hardware.json would brick the next render.
+    local key=$1 value=$2
+    command -v jq >/dev/null 2>&1 \
+        || die "jq is required for the hardware wizard (sudo apt install jq)"
+    local base new tmp
+    base=$(hw_base_json)
+    new=$(printf '%s' "$base" | jq --argjson v "$value" ".${key} = \$v") \
+        || die "failed to update hardware.json (jq error)"
+    tmp=$(mktemp "${HW_FILE}.XXXXXX") || die "mktemp failed for $HW_FILE"
+    printf '%s\n' "$new" >"$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$HW_FILE"
+}
+
+# --- audio wizard -----------------------------------------------------------
+# Host PipeWire/Pulse conflict detection + mitigation. This is the #1
+# real-world "no audio in the container" cause: a user-session audio daemon
+# holds the ALSA device EBUSY and svxlink's open fails. Echoes the recorded
+# mitigation (mask|wireplumber|none) on stdout; prompts go to stderr because
+# callers capture stdout. Returns 1 when the operator declines both options
+# while the device is held (we refuse to configure a card that cannot open).
+_audio_mitigation() {
+    local rx_num=$1 tx_num=$2
+    local held="" u
+    for u in pipewire.socket pipewire wireplumber pulseaudio.socket pulseaudio; do
+        if systemctl --user is-active --quiet "$u" 2>/dev/null; then
+            held+="$u "
+        fi
+    done
+    local busy="" node
+    if command -v fuser >/dev/null 2>&1; then
+        for node in /dev/snd/pcmC"${rx_num}"D* /dev/snd/controlC"${rx_num}" \
+                    /dev/snd/pcmC"${tx_num}"D* /dev/snd/controlC"${tx_num}"; do
+            [[ -e "$node" ]] || continue
+            if fuser -s "$node" 2>/dev/null; then
+                busy+="$node "
+            fi
+        done
+    fi
+    if [[ -z "$held" && -z "$busy" ]]; then
+        echo "none"
+        return 0
+    fi
+    {
+        echo
+        echo "[WARN] A host audio stack is active and may hold the sound card:"
+        [[ -n "$held" ]] && echo "       active user units: $held"
+        [[ -n "$busy" ]] && echo "       busy device nodes: $busy"
+        echo "       svxlink in the container needs exclusive ALSA access."
+        echo
+        echo "  1) mask the host audio services (recommended for a dedicated repeater"
+        echo "     host — this box then has no desktop audio at all)"
+        echo "  2) keep the desktop audio stack, tell wireplumber to ignore just this"
+        echo "     card (per-card ignore; matching is name-based and can be fragile)"
+        echo "  3) abort the wizard"
+    } >&2
+    # Default: mask on headless hosts (no graphical session = dedicated
+    # repeater assumption); the per-card path is only the default when a
+    # desktop is actually running.
+    local def=1
+    if systemctl is-active --quiet graphical.target 2>/dev/null; then
+        def=2
+    fi
+    local pick
+    if ! read -r -p "Choice [${def}]: " pick; then pick=""; fi
+    pick=${pick:-$def}
+    case "$pick" in
+        1)
+            systemctl --user mask --now pipewire pipewire.socket wireplumber \
+                pulseaudio.socket pulseaudio >/dev/null 2>&1 || true
+            echo "[OK] host audio services masked (undo: systemctl --user unmask ...)" >&2
+            echo "mask"
+            ;;
+        2)
+            local wp_dir="${HOME}/.config/wireplumber/wireplumber.conf.d"
+            local card_name
+            # The descriptive name from /proc/asound/cards ("N [ID ]: drv - Name").
+            card_name=$(sed -n "s/^ *${rx_num} \[[^]]*\]: [^-]*- //p" /proc/asound/cards | head -1)
+            mkdir -p "$wp_dir"
+            {
+                echo "# Written by svx audio (svxlink-universal-installer):"
+                echo "# hide this card from the desktop audio stack so the svxlink"
+                echo "# container gets exclusive ALSA access. Name matching is the only"
+                echo "# per-card hook wireplumber offers and IS fragile — if the card"
+                echo "# reappears in the mixer after a firmware change, re-run svx audio."
+                echo "monitor.alsa.rules = ["
+                echo "  {"
+                echo "    matches = [ { alsa.card_name = \"${card_name}\" } ]"
+                echo "    actions = { update-props = { device.disabled = true } }"
+                echo "  }"
+                echo "]"
+            } >"$wp_dir/50-svxlink-reserve.conf"
+            systemctl --user restart wireplumber >/dev/null 2>&1 || true
+            echo "[OK] wireplumber per-card ignore written; wireplumber restarted" >&2
+            echo "wireplumber"
+            ;;
+        *)
+            echo "[ERR] aborted — the card is held by the host audio stack; svxlink" >&2
+            echo "      cannot open it until one of the mitigations is applied." >&2
+            return 1
+            ;;
+    esac
+}
+
+cmd_audio() {
+    [[ -t 0 ]] || die "svx audio is interactive (run it from a terminal)"
+    command -v jq >/dev/null 2>&1 \
+        || die "jq is required for the hardware wizard (sudo apt install jq)"
+    [[ -d /proc/asound ]] || die "no ALSA subsystem on this host (/proc/asound missing)"
+
+    local nums=() ids=() d
+    for d in /proc/asound/card[0-9]*; do
+        [[ -d "$d" ]] || continue
+        nums+=("${d##*card}")
+        ids+=("$(cat "$d/id" 2>/dev/null || echo "card${d##*card}")")
+    done
+    (( ${#ids[@]} > 0 )) || die "no sound cards detected (is the USB audio device plugged in?)"
+
+    echo "Detected sound cards:"
+    local i
+    for i in "${!ids[@]}"; do
+        printf '  %2d) CARD=%s (ALSA card %s)\n' "$((i + 1))" "${ids[$i]}" "${nums[$i]}"
+    done
+    echo
+    echo "aplay -l for context:"
+    aplay -l 2>/dev/null || echo "(aplay not available)"
+    echo
+
+    # Always plughw:CARD=<id> (never a bare index, never raw hw:):
+    #  - USB card NUMBERING shifts across boots; the CARD= name is stable.
+    #  - plughw inserts rate/format conversion: svxlink runs 16 kHz
+    #    internally while most USB codecs only do 44.1/48 kHz natively —
+    #    raw hw: fails with a rate mismatch. CARD_SAMPLE_RATE=48000 +
+    #    plughw is the combination verified on real CM108 hardware.
+    local pick rx_i tx_i
+    if ! read -r -p "RX (receiver audio in) card [1]: " pick; then pick=""; fi
+    pick=${pick:-1}
+    if [[ ! "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > ${#ids[@]} )); then
+        die "invalid selection: $pick"
+    fi
+    rx_i=$((pick - 1))
+    if ! read -r -p "TX (transmitter audio out) card [Enter = same as RX]: " pick; then pick=""; fi
+    if [[ -z "$pick" ]]; then
+        tx_i=$rx_i
+    else
+        if [[ ! "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > ${#ids[@]} )); then
+            die "invalid selection: $pick"
+        fi
+        tx_i=$((pick - 1))
+    fi
+    local rx_id="${ids[$rx_i]}" tx_id="${ids[$tx_i]}"
+    local rx_num="${nums[$rx_i]}" tx_num="${nums[$tx_i]}"
+
+    local mitigation
+    mitigation=$(_audio_mitigation "$rx_num" "$tx_num") || exit 1
+
+    local ans
+    if ! read -r -p "Run a 2-second record/playback loopback test in the container? [y/N] " ans; then
+        ans=""
+    fi
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        local img
+        img=$(svx_image)
+        echo "[i] Recording 2 s from CARD=${rx_id} — speak into the receiver/mic now..."
+        if podman run --rm --device /dev/snd --group-add keep-groups "$img" sh -c \
+            "arecord -D plughw:CARD=${rx_id},DEV=0 -d 2 -f S16_LE -r 48000 /tmp/t.wav \
+             && aplay -D plughw:CARD=${tx_id},DEV=0 /tmp/t.wav"; then
+            if ! read -r -p "Did you hear the recording played back? [y/N] " ans; then ans=""; fi
+            if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+                warn "no audible playback — check levels (alsamixer -c ${tx_num}) or the card choice"
+            fi
+        else
+            warn "loopback test failed — device still held by a host audio daemon, or wrong card"
+        fi
+    fi
+
+    seed_set "$ETC_DIR/svxlink.conf" Rx1 AUDIO_DEV "alsa:plughw:CARD=${rx_id},DEV=0"
+    seed_set "$ETC_DIR/svxlink.conf" Rx1 CARD_SAMPLE_RATE 48000
+    seed_set "$ETC_DIR/svxlink.conf" Tx1 AUDIO_DEV "alsa:plughw:CARD=${tx_id},DEV=0"
+    seed_set "$ETC_DIR/svxlink.conf" Tx1 CARD_SAMPLE_RATE 48000
+    ok "svxlink.conf [Rx1]/[Tx1] updated"
+
+    # A card-less install parked the active logic on RX=NONE/TX=NONE so the
+    # node could start at all (see install.sh step 12). Now that a real card
+    # is configured, flip the logic back to the hardware pair — but only the
+    # parked values; any other operator choice stays untouched.
+    local active_logic cur_rx cur_tx
+    active_logic=$(sed -n 's/^LOGICS=//p' "$ETC_DIR/svxlink.conf" 2>/dev/null | head -1 | cut -d, -f1)
+    if [[ -n "$active_logic" ]]; then
+        cur_rx=$(sed -n "/^\[$active_logic\]/,/^\[/{s/^RX=//p}" "$ETC_DIR/svxlink.conf" | head -1)
+        cur_tx=$(sed -n "/^\[$active_logic\]/,/^\[/{s/^TX=//p}" "$ETC_DIR/svxlink.conf" | head -1)
+        if [[ "$cur_rx" == "NONE" && "$cur_tx" == "NONE" ]]; then
+            seed_set "$ETC_DIR/svxlink.conf" "$active_logic" RX Rx1
+            seed_set "$ETC_DIR/svxlink.conf" "$active_logic" TX Tx1
+            ok "$active_logic re-attached to Rx1/Tx1 (was parked audio-less)"
+        fi
+    fi
+
+    local audio_json
+    audio_json=$(jq -n --arg rx "$rx_id" --arg tx "$tx_id" --arg mit "$mitigation" \
+        '{rx: {card: $rx, dev: ("alsa:plughw:CARD=" + $rx + ",DEV=0"), sampleRate: 48000},
+          tx: {card: $tx, dev: ("alsa:plughw:CARD=" + $tx + ",DEV=0"), sampleRate: 48000},
+          hostAudioMitigation: $mit}')
+    hw_set audio "$audio_json"
+    ok "hardware.json updated"
+
+    cmd_render_server --no-restart
+    offer_restart
+}
+
+# --- PTT wizard -------------------------------------------------------------
+# Content-equality idempotent udev rule install (the journald-drop-in
+# pattern: the rule file is world-readable, so the compare needs no sudo and
+# re-runs stay prompt-free). The rule is MANDATORY for CM108 PTT: hidraw
+# nodes are root:root 0600 with no group at all, so GroupAdd=keep-groups can
+# never help — only udev can grant a group + stable name.
+_install_udev_rule() {
+    local rule=$1
+    if [[ "$(cat "$UDEV_RULE_FILE" 2>/dev/null)" == "$rule" ]]; then
+        ok "udev rule already installed ($UDEV_RULE_FILE)"
+    else
+        printf '%s\n' "$rule" | sudo tee "$UDEV_RULE_FILE" >/dev/null || return 1
+        sudo udevadm control --reload || return 1
+        sudo udevadm trigger --subsystem-match=hidraw || return 1
+    fi
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        [[ -e /dev/svxlink-ptt ]] && break
+        sleep 1
+    done
+    if [[ ! -e /dev/svxlink-ptt ]]; then
+        err "/dev/svxlink-ptt did not appear — replug the device, then check:"
+        err "    udevadm info /dev/hidraw*  |  cat $UDEV_RULE_FILE"
+        return 1
+    fi
+    local grp
+    grp=$(stat -c %G "$(readlink -f /dev/svxlink-ptt)" 2>/dev/null || echo '?')
+    if [[ "$grp" != "audio" ]]; then
+        warn "PTT node group is '$grp', expected 'audio' — the container may not reach it"
+    fi
+    ok "/dev/svxlink-ptt present (group $grp)"
+}
+
+_ptt_hidraw() {
+    local devs=() prods=() kerns=() h uevent hid prod kern
+    for h in /dev/hidraw*; do
+        [[ -e "$h" ]] || continue
+        uevent="/sys/class/hidraw/${h##*/}/device/uevent"
+        hid=$(sed -n 's/^HID_ID=//p' "$uevent" 2>/dev/null || true)
+        # HID_ID is bus:vendor:product, e.g. 0003:00000D8C:0000013C.
+        # Match the VENDOR field only (0d8c = C-Media) — a product id that
+        # happens to contain 0d8c must not match.
+        printf '%s' "$hid" | grep -qi ':00000d8c:' || continue
+        prod=$(printf '%s' "$hid" | sed -n 's/.*:0000\([0-9A-Fa-f]\{4\}\)$/\1/p' \
+            | tr '[:upper:]' '[:lower:]')
+        # USB port path (e.g. "3-1.4") for a KERNELS== pin when more than
+        # one CM108 is present; the last port-shaped component of the sysfs
+        # device path is the hub position.
+        kern=$(readlink -f "/sys/class/hidraw/${h##*/}/device" 2>/dev/null \
+            | grep -oE '[0-9]+-[0-9]+(\.[0-9]+)*' | tail -1 || true)
+        devs+=("$h")
+        prods+=("$prod")
+        kerns+=("${kern:-}")
+    done
+    if (( ${#devs[@]} == 0 )); then
+        err "no C-Media (0d8c) hidraw device found."
+        err "    check: lsusb | grep -i 0d8c   and   ls -l /dev/hidraw*"
+        return 1
+    fi
+    local sel=0 kernels=""
+    if (( ${#devs[@]} > 1 )); then
+        echo "Multiple C-Media devices found:"
+        local i
+        for i in "${!devs[@]}"; do
+            printf '  %2d) %s (product 0x%s, usb port %s)\n' \
+                "$((i + 1))" "${devs[$i]}" "${prods[$i]}" "${kerns[$i]:-?}"
+        done
+        local pick
+        if ! read -r -p "Which one drives PTT? [1]: " pick; then pick=""; fi
+        pick=${pick:-1}
+        if [[ ! "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > ${#devs[@]} )); then
+            err "invalid selection: $pick"
+            return 1
+        fi
+        sel=$((pick - 1))
+        # With several identical adapters only the USB port path
+        # disambiguates — pin the rule to it (means: keep the PTT adapter
+        # in this physical port).
+        kernels="${kerns[$sel]}"
+    fi
+    local prod="${prods[$sel]}"
+    local pin
+    if ! read -r -p "CM108 GPIO pin wired to PTT [1-4, most boards use 3]: " pin; then pin=""; fi
+    pin=${pin:-3}
+    [[ "$pin" =~ ^[1-4]$ ]] || { err "PTT pin must be 1-4"; return 1; }
+
+    [[ -f "$PAYLOAD_DIR/lib/udev-rule.sh" ]] \
+        || { err "payload missing (lib/udev-rule.sh) — run 'svx self-update'"; return 1; }
+    # shellcheck disable=SC1090,SC1091
+    . "$PAYLOAD_DIR/lib/udev-rule.sh"
+    local rule
+    if [[ -n "$kernels" ]]; then
+        rule=$(udev_rule_cm108 "$prod" "$kernels")
+    else
+        rule=$(udev_rule_cm108 "$prod")
+    fi
+    _install_udev_rule "$rule" || return 1
+
+    seed_set "$ETC_DIR/svxlink.conf" Tx1 PTT_TYPE Hidraw
+    seed_set "$ETC_DIR/svxlink.conf" Tx1 HID_DEVICE /dev/svxlink-ptt
+    seed_set "$ETC_DIR/svxlink.conf" Tx1 HID_PTT_PIN "GPIO${pin}"
+    local ptt_json
+    ptt_json=$(jq -n --arg p "GPIO${pin}" \
+        '{type: "hidraw", device: "/dev/svxlink-ptt", pin: $p, invert: false}')
+    hw_set ptt "$ptt_json"
+    ok "PTT: CM108 hidraw via /dev/svxlink-ptt (GPIO${pin})"
+}
+
+_pick_serial_port() {
+    # Always /dev/serial/by-id (never /dev/ttyUSB0 — renumbering across
+    # boots/replugs). Echoes the chosen path; menu on stderr.
+    local ports=() p
+    for p in /dev/serial/by-id/*; do
+        [[ -e "$p" ]] && ports+=("$p")
+    done
+    if (( ${#ports[@]} == 0 )); then
+        echo "[ERR] no /dev/serial/by-id entries — is the USB-serial adapter plugged in?" >&2
+        return 1
+    fi
+    {
+        echo "Serial adapters:"
+        local i
+        for i in "${!ports[@]}"; do
+            printf '  %2d) %s\n' "$((i + 1))" "${ports[$i]}"
+        done
+    } >&2
+    local pick
+    if ! read -r -p "Adapter [1]: " pick; then pick=""; fi
+    pick=${pick:-1}
+    if [[ ! "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > ${#ports[@]} )); then
+        echo "[ERR] invalid selection: $pick" >&2
+        return 1
+    fi
+    printf '%s' "${ports[$((pick - 1))]}"
+}
+
+_ptt_serial() {
+    local port
+    port=$(_pick_serial_port) || return 1
+    echo "PTT pin:  1) RTS   2) DTR   3) DTRRTS (both)"
+    local pick pin
+    if ! read -r -p "Pin [1]: " pick; then pick=""; fi
+    case "${pick:-1}" in
+        1) pin=RTS ;;
+        2) pin=DTR ;;
+        3) pin=DTRRTS ;;
+        *) err "invalid selection"; return 1 ;;
+    esac
+    local ans invert=false token="$pin"
+    if ! read -r -p "Invert the pin (PTT active when the line is LOW)? [y/N] " ans; then ans=""; fi
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        invert=true
+        # svxlink inverts a SerialPin PTT with a '!' prefix (PTT_PIN=!RTS).
+        token="!${pin}"
+    fi
+    seed_set "$ETC_DIR/svxlink.conf" Tx1 PTT_TYPE SerialPin
+    seed_set "$ETC_DIR/svxlink.conf" Tx1 PTT_PORT "$port"
+    seed_set "$ETC_DIR/svxlink.conf" Tx1 PTT_PIN "$token"
+    local ptt_json
+    ptt_json=$(jq -n --arg d "$port" --arg p "$pin" --argjson inv "$invert" \
+        '{type: "serial", device: $d, pin: $p, invert: $inv}')
+    hw_set ptt "$ptt_json"
+    ok "PTT: serial ${token} on ${port}"
+    # podman resolves the by-id symlink at container CREATE; after a replug
+    # the container still holds the old node until recreated.
+    echo "[i] Note: after replugging the adapter, run 'svx restart' so the"
+    echo "    container picks up the re-enumerated device node."
+}
+
+_pick_gpiod_line() {
+    # Echoes "chip line" (chip without /dev/); menus on stderr. Shared by
+    # the PTT and squelch pickers.
+    command -v gpiodetect >/dev/null 2>&1 \
+        || { echo "[ERR] gpiod tools missing: sudo apt install gpiod" >&2; return 1; }
+    {
+        echo "GPIO chips:"
+        gpiodetect 2>/dev/null || true
+        # Pi 5: the 40-pin header lives on the RP1 chip — check the
+        # gpiodetect labels (pinctrl-rp1), not just gpiochip0.
+        if grep -qi 'raspberry pi 5' /proc/device-tree/model 2>/dev/null; then
+            echo "(Pi 5: the header GPIOs are on the RP1 chip — check the labels above)"
+        fi
+    } >&2
+    local chip
+    if ! read -r -p "Chip [gpiochip0]: " chip; then chip=""; fi
+    chip=${chip:-gpiochip0}
+    chip="${chip#/dev/}"
+    [[ -e "/dev/$chip" ]] || { echo "[ERR] /dev/$chip does not exist" >&2; return 1; }
+    {
+        echo "Lines on $chip (first 40):"
+        gpioinfo "$chip" 2>/dev/null | sed -n '1,40p' || true
+    } >&2
+    local line
+    if ! read -r -p "Line number: " line; then line=""; fi
+    [[ "$line" =~ ^[0-9]+$ ]] || { echo "[ERR] line must be a number" >&2; return 1; }
+    printf '%s %s' "$chip" "$line"
+}
+
+_ptt_gpiod() {
+    local sel chip line
+    sel=$(_pick_gpiod_line) || return 1
+    chip=${sel% *}
+    line=${sel#* }
+    seed_set "$ETC_DIR/svxlink.conf" Tx1 PTT_TYPE GPIOD
+    seed_set "$ETC_DIR/svxlink.conf" Tx1 PTT_GPIOD_CHIP "/dev/$chip"
+    seed_set "$ETC_DIR/svxlink.conf" Tx1 PTT_GPIOD_LINE "$line"
+    local ptt_json
+    ptt_json=$(jq -n --arg d "/dev/$chip" --arg p "$line" \
+        '{type: "gpiod", device: $d, pin: $p, invert: false}')
+    hw_set ptt "$ptt_json"
+    ok "PTT: gpiod line $line on /dev/$chip"
+}
+
+_ptt_none() {
+    seed_set "$ETC_DIR/svxlink.conf" Tx1 PTT_TYPE NONE
+    local ptt_json
+    ptt_json=$(jq -n '{type: "none"}')
+    hw_set ptt "$ptt_json"
+    ok "PTT: none (receive-only / VOX-only node)"
+}
+
+_squelch_wizard() {
+    echo
+    echo "Squelch (signal detection):"
+    echo "  1) VOX — audio-level detection, no wiring (default)"
+    echo "  2) COS via GPIO (gpiod)"
+    echo "  3) COS via serial (CTS/DSR)"
+    local pick
+    if ! read -r -p "Squelch [1]: " pick; then pick=""; fi
+    local sq_json
+    case "${pick:-1}" in
+        1)
+            seed_set "$ETC_DIR/svxlink.conf" Rx1 SQL_DET VOX
+            sq_json=$(jq -n '{type: "VOX"}')
+            ;;
+        2)
+            local sel chip line
+            sel=$(_pick_gpiod_line) || return 1
+            chip=${sel% *}
+            line=${sel#* }
+            seed_set "$ETC_DIR/svxlink.conf" Rx1 SQL_DET GPIOD
+            seed_set "$ETC_DIR/svxlink.conf" Rx1 SQL_GPIOD_CHIP "/dev/$chip"
+            seed_set "$ETC_DIR/svxlink.conf" Rx1 SQL_GPIOD_LINE "$line"
+            sq_json=$(jq -n '{type: "GPIOD"}')
+            ;;
+        3)
+            local port
+            port=$(_pick_serial_port) || return 1
+            echo "COS pin:  1) CTS   2) DSR"
+            local p2 pin
+            if ! read -r -p "Pin [1]: " p2; then p2=""; fi
+            case "${p2:-1}" in
+                1) pin=CTS ;;
+                2) pin=DSR ;;
+                *) err "invalid selection"; return 1 ;;
+            esac
+            seed_set "$ETC_DIR/svxlink.conf" Rx1 SQL_DET SERIAL
+            seed_set "$ETC_DIR/svxlink.conf" Rx1 SERIAL_PORT "$port"
+            seed_set "$ETC_DIR/svxlink.conf" Rx1 SERIAL_PIN "$pin"
+            sq_json=$(jq -n '{type: "SERIAL"}')
+            ;;
+        *)
+            err "invalid selection"
+            return 1
+            ;;
+    esac
+    hw_set squelch "$sq_json"
+    ok "squelch configured"
+}
+
+cmd_ptt() {
+    [[ -t 0 ]] || die "svx ptt is interactive (run it from a terminal)"
+    command -v jq >/dev/null 2>&1 \
+        || die "jq is required for the hardware wizard (sudo apt install jq)"
+    [[ -f "$ETC_DIR/svxlink.conf" ]] || die "no config at $ETC_DIR — run the installer first"
+    echo "PTT hardware:"
+    echo "  1) CM108/CM119 USB sound-fob GPIO (hidraw) — needs a udev rule (sudo)"
+    echo "  2) Serial adapter pin (RTS/DTR)"
+    echo "  3) Raspberry Pi GPIO via gpiod"
+    echo "  4) None (receive-only / VOX-only)"
+    local pick
+    if ! read -r -p "PTT [1]: " pick; then pick=""; fi
+    case "${pick:-1}" in
+        1) _ptt_hidraw || exit 1 ;;
+        2) _ptt_serial || exit 1 ;;
+        3) _ptt_gpiod  || exit 1 ;;
+        4) _ptt_none ;;
+        *) die "invalid selection" ;;
+    esac
+    _squelch_wizard || exit 1
+    cmd_render_server --no-restart
+    offer_restart
+}
+
+# --- sounds -----------------------------------------------------------------
+cmd_sounds() {
+    local sub="${1:-list}"
+    if [[ $# -gt 0 ]]; then shift; fi
+    case "$sub" in
+        list)
+            echo "Baked into the image: en_US (see the org.svxlink.image.sounds label)"
+            echo "Host overrides in $SVX_HOME/sounds/:"
+            local d found=false
+            for d in "$SVX_HOME"/sounds/*/; do
+                [[ -d "$d" ]] || continue
+                found=true
+                printf '  %s\n' "$(basename "$d")"
+            done
+            [[ "$found" == false ]] && echo "  (none)"
+            return 0
+            ;;
+        install)
+            (( $# >= 2 )) || die "usage: svx sounds install <lang> <url-or-tarball>"
+            local lang=$1 src=$2
+            [[ "$lang" =~ ^[A-Za-z_]+$ ]] || die "language must look like en_US / de_DE"
+            local tmp
+            tmp=$(mktemp -d -t svx-sounds.XXXXXX) || die "mktemp failed"
+            case "$src" in
+                http://*|https://*)
+                    info "downloading $src"
+                    curl -fL -m 600 -o "$tmp/pack.tar" "$src" \
+                        || { rm -rf "$tmp"; die "download failed: $src"; }
+                    ;;
+                *)
+                    [[ -f "$src" ]] || { rm -rf "$tmp"; die "no such file: $src"; }
+                    cp "$src" "$tmp/pack.tar"
+                    ;;
+            esac
+            mkdir -p "$tmp/x"
+            # GNU tar auto-detects the compression (.tar.bz2/.tar.gz/.tar.xz)
+            # from a seekable file, so no per-format flags.
+            tar -xf "$tmp/pack.tar" -C "$tmp/x" \
+                || { rm -rf "$tmp"; die "could not unpack the tarball"; }
+            # Upstream packs wrap everything in one top-level dir — strip it.
+            local root="$tmp/x" entries=()
+            local e
+            for e in "$tmp/x"/*; do
+                entries+=("$e")
+            done
+            if (( ${#entries[@]} == 1 )) && [[ -d "${entries[0]}" ]]; then
+                root="${entries[0]}"
+            fi
+            # Core/ holds the mandatory prompt set; a pack without it would
+            # mount fine and then fail at runtime with missing-sound errors.
+            [[ -d "$root/Core" ]] \
+                || { rm -rf "$tmp"; die "no Core/ directory in the pack — not a svxlink sounds layout"; }
+            local dest="$SVX_HOME/sounds/$lang"
+            if [[ -d "$dest" ]]; then
+                [[ -t 0 ]] || { rm -rf "$tmp"; die "$dest exists — remove it first (svx sounds remove $lang)"; }
+                local ans
+                if ! read -r -p "$dest exists — replace it? [y/N] " ans; then ans=""; fi
+                [[ "$ans" =~ ^[Yy]$ ]] || { rm -rf "$tmp"; die "aborted"; }
+                rm -rf "$dest"
+            fi
+            mkdir -p "$SVX_HOME/sounds"
+            mv "$root" "$dest"
+            rm -rf "$tmp"
+            ok "installed sounds pack: $dest"
+            if [[ -t 0 ]]; then
+                local ans2
+                if ! read -r -p "Set DEFAULT_LANG=$lang in svxlink.conf [GLOBAL]? [y/N] " ans2; then ans2=""; fi
+                if [[ "$ans2" =~ ^[Yy]$ ]]; then
+                    seed_set "$ETC_DIR/svxlink.conf" GLOBAL DEFAULT_LANG "$lang"
+                fi
+            fi
+            # Re-render adds the per-language ro mount (never the whole
+            # sounds/ dir — that would shadow the baked packs).
+            cmd_render_server --no-restart
+            offer_restart
+            ;;
+        remove)
+            (( $# >= 1 )) || die "usage: svx sounds remove <lang>"
+            local lang=$1
+            local dest="$SVX_HOME/sounds/$lang"
+            [[ -d "$dest" ]] || die "no such installed pack: $dest"
+            if [[ -t 0 ]]; then
+                local ans
+                if ! read -r -p "Delete $dest? [y/N] " ans; then ans=""; fi
+                [[ "$ans" =~ ^[Yy]$ ]] || die "aborted"
+            fi
+            rm -rf "$dest"
+            ok "removed $dest"
+            cmd_render_server --no-restart
+            offer_restart
+            ;;
+        *)
+            err "Unknown sounds subcommand: $sub (use list|install|remove)"
+            return 1
+            ;;
+    esac
+}
+
+# --- resolv-watch: container DNS self-heal ----------------------------------
+# podman copies the host's /etc/resolv.conf into svxlink-server once per
+# container CREATE. A boot that beats DHCP (Pi and router powered on
+# together) freezes an EMPTY resolver list into the container — the
+# EchoLink directory login then fails permanently until the container is
+# recreated. The server Quadlet's short ExecStartPre wait covers fast DHCP;
+# this pair of user units covers the slow-router case: a path unit watches
+# the host DNS config and a oneshot recreates svxlink-server ONLY when the
+# host has a nameserver and the running container has none. Self-limiting:
+# after the restart the container has the nameserver, so later triggers
+# (DHCP renews, VPN resolv rewrites) exit without touching the server.
+# The [Path] watch list is generated PER HOST by _resolv_watch_path_unit():
+# a PathChanged= whose PARENT DIRECTORY does not exist makes the whole unit
+# fail to start with Result: resources (inotify cannot watch a missing
+# dir) — observed 2026-07-30 on a host without systemd-resolved, where the
+# static list's /run/systemd/resolve/* entries killed the watch entirely.
+# Only candidates whose parent dir exists at install time are emitted;
+# after switching resolver stacks, re-run `svx resolv-watch install`.
+RESOLV_WATCH_CANDIDATES=(
+    /etc/resolv.conf
+    /run/systemd/resolve/stub-resolv.conf
+    /run/systemd/resolve/resolv.conf
+    /run/NetworkManager/resolv.conf
+    /run/resolvconf/resolv.conf
+)
+
+_resolv_watch_path_unit() {
+    local p lines=""
+    for p in "${RESOLV_WATCH_CANDIDATES[@]}"; do
+        [[ -d "$(dirname "$p")" ]] || continue
+        lines+="PathChanged=${p}"$'\n'
+    done
+    printf '%s' '# Installed by svxlink-universal-installer (svx resolv-watch)
+[Unit]
+Description=Watch host DNS configuration for the SvxLink container node
+
+[Path]
+# Several watch points because resolver stacks differ in WHERE the file
+# that finally carries the nameservers lives. /etc/resolv.conf covers the
+# direct writers (dhcpcd, NetworkManager rc-manager=file), including
+# atomic rename-into-place; the /run entries cover the symlink layouts
+# (systemd-resolved, NetworkManager rc-manager=symlink, resolvconf):
+# inotify follows the /etc/resolv.conf symlink at watch-setup time, so a
+# target that is dangling at boot can escape the first watch entirely.
+# Only watch points whose parent dir exists on THIS host are listed — a
+# missing parent makes the unit fail with Result: resources. Regenerate
+# after switching resolver stacks: svx resolv-watch install
+'
+    printf '%s\n[Install]\nWantedBy=default.target' "$lines"
+}
+# shellcheck disable=SC2016  # %h and the quoted unit text are systemd syntax, not shell
+RESOLV_WATCH_SERVICE_UNIT='# Installed by svxlink-universal-installer (svx resolv-watch)
+[Unit]
+Description=Recreate svxlink-server when host DNS appeared after its start
+# The probe + recovery logic lives in the CLI (`svx resolv-watch heal`);
+# the unit is inert when the CLI is missing.
+ConditionPathExists=%h/.local/bin/svx
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/svx resolv-watch heal'
+
+_svx_ensure_resolv_watch() {
+    local unit_dir="${HOME}/.config/systemd/user"
+    local path_file="${unit_dir}/svxlink-resolv-watch.path"
+    local svc_file="${unit_dir}/svxlink-resolv-watch.service"
+    # Generated per host (see RESOLV_WATCH_CANDIDATES) — the content compare
+    # below also makes re-runs converge after a resolver-stack switch.
+    local resolv_watch_path_unit
+    resolv_watch_path_unit=$(_resolv_watch_path_unit)
+
+    if [[ "$(cat "$path_file" 2>/dev/null)" == "$resolv_watch_path_unit" ]] \
+        && [[ "$(cat "$svc_file" 2>/dev/null)" == "$RESOLV_WATCH_SERVICE_UNIT" ]] \
+        && systemctl --user is-enabled svxlink-resolv-watch.path >/dev/null 2>&1; then
+        ok "svxlink-resolv-watch units already installed."
+        return 0
+    fi
+
+    mkdir -p "$unit_dir"
+    local f content tmp
+    for f in "$path_file" "$svc_file"; do
+        if [[ "$f" == "$path_file" ]]; then
+            content="$resolv_watch_path_unit"
+        else
+            content="$RESOLV_WATCH_SERVICE_UNIT"
+        fi
+        tmp=$(mktemp "${f}.XXXXXX") || { err "mktemp failed for $f"; return 1; }
+        if ! printf '%s\n' "$content" >"$tmp" || ! chmod 0644 "$tmp" || ! mv -f "$tmp" "$f"; then
+            err "Failed to install $f."
+            rm -f "$tmp"
+            return 1
+        fi
+    done
+
+    systemctl --user daemon-reload || {
+        err "systemctl --user daemon-reload failed; the units are on disk but"
+        err "not parsed. Retry:  systemctl --user daemon-reload"
+        return 1
+    }
+    systemctl --user enable --now svxlink-resolv-watch.path >/dev/null 2>&1 || {
+        err "could not enable svxlink-resolv-watch.path"
+        return 1
+    }
+    ok "svxlink-resolv-watch units installed and watching /etc/resolv.conf."
+}
+
+# The oneshot's entry point. Ordered guards, each a clean no-op exit:
+#   1. host has no nameserver     -> nothing to heal towards
+#   2. container not running      -> its next start snapshots fresh; also
+#                                    gives try-restart semantics (never
+#                                    start a unit the operator stopped)
+#   3. container has a nameserver -> healthy, nothing to do
+# Only then recreate the container. SVX_RESOLV_CONF is a test seam.
+_svx_resolv_heal() {
+    local resolv="${SVX_RESOLV_CONF:-/etc/resolv.conf}"
+    grep -qs '^nameserver' "$resolv" || return 0
+    podman exec svxlink-server true 2>/dev/null || return 0
+    podman exec svxlink-server grep -qs '^nameserver' /etc/resolv.conf && return 0
+    echo "[i] Host DNS is configured but the svxlink-server container has no nameserver — recreating it."
+    _svx_restart_server
+}
+
+cmd_resolv_watch() {
+    case "${1:-install}" in
+        install|'') _svx_ensure_resolv_watch ;;
+        heal) _svx_resolv_heal ;;
+        *) err "Unknown resolv-watch argument: $1 (use install|heal)"; return 1 ;;
+    esac
+}
+
+cmd_render_server() {
+    # Thin wrapper over the staged renderer (single owner of the fenced-block
+    # logic — it splices the live Image= and USER ADDITIONS, snapshots,
+    # short-circuits byte-identical renders, writes atomically). This wrapper
+    # only decides whether a daemon-reload + restart is needed, keyed on
+    # whether the file actually changed.
+    local no_restart=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-restart) no_restart=true; shift ;;
+            *) err "Unknown render-server argument: $1"; return 1 ;;
+        esac
+    done
+
+    # The DNS self-heal units ride along with every render so existing boxes
+    # pick them up on 'svx self-update'. Non-fatal: a failed unit install
+    # must not block a template render.
+    _svx_ensure_resolv_watch \
+        || warn "could not install the svxlink-resolv-watch units (continuing)"
+
+    local renderer="$PAYLOAD_DIR/render-server-quadlet.sh"
+    local template="$PAYLOAD_DIR/svxlink-server.container.template"
+    if [[ ! -f "$renderer" || ! -f "$template" ]]; then
+        err "staged renderer/template not found under $PAYLOAD_DIR."
+        err "Run 'svx self-update' first (it stages them), or re-run the installer."
+        return 1
+    fi
+    if [[ ! -f "$HW_FILE" ]]; then
+        err "hardware.json not found at $HW_FILE."
+        err "Run 'svx audio' / 'svx ptt' (or re-run the installer) to create it."
+        return 1
+    fi
+
+    local before after
+    before=$(cksum "$SERVER_QUADLET" 2>/dev/null || echo absent)
+    bash "$renderer" || {
+        err "render-server-quadlet.sh failed (see error above)."
+        return 1
+    }
+    after=$(cksum "$SERVER_QUADLET" 2>/dev/null || echo absent)
+
+    if [[ "$before" == "$after" ]]; then
+        ok "live svxlink-server Quadlet already matches the render — nothing to do."
+        return 0
+    fi
+
+    systemctl --user daemon-reload || {
+        err "systemctl --user daemon-reload failed; the new Quadlet is on disk"
+        err "but not parsed. Retry:  systemctl --user daemon-reload"
+        return 1
+    }
+
+    if [[ "$no_restart" == true ]]; then
+        echo "[i] --no-restart: the new Quadlet is in place but svxlink-server is"
+        echo "    still running the old one. Apply with: svx restart"
+        return 0
+    fi
+    info "restarting svxlink-server to apply the new Quadlet..."
+    _svx_restart_server
+}
+
+# --- dashboard --------------------------------------------------------------
+# Rootless podman binds the published port as the invoking user, so a port
+# below 1024 needs the HOST's unprivileged-port floor lowered. The sysctl
+# file's EXISTENCE is the durable record of the operator's consent (re-runs
+# never re-prompt). Applied via `tee /proc/sys/...`, not `sysctl` — procps
+# can be absent and /usr/sbin may not be on the user PATH.
+_ensure_unprivileged_port_floor() {
+    local port=$1
+    local f=/etc/sysctl.d/80-svxlink-unprivileged-ports.conf
+    local current
+    current=$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || echo 1024)
+    if (( current <= port )); then
+        return 0
+    fi
+    if [[ ! -f "$f" && -t 0 ]]; then
+        echo "Port $port is privileged. Allowing it means lowering the SYSTEM-WIDE"
+        echo "unprivileged-port floor (net.ipv4.ip_unprivileged_port_start=$port),"
+        echo "which lets ANY local user bind ports >= $port."
+        local ans
+        if ! read -r -p "Write /etc/sysctl.d and apply now (sudo)? [y/N] " ans; then ans=""; fi
+        [[ "$ans" =~ ^[Yy]$ ]] || { err "declined — pick a port >= 1024 instead"; return 1; }
+    elif [[ ! -f "$f" ]]; then
+        err "port $port needs the sysctl consent file $f — run interactively once"
+        return 1
+    fi
+    printf 'net.ipv4.ip_unprivileged_port_start=%s\n' "$port" | sudo tee "$f" >/dev/null \
+        || return 1
+    printf '%s' "$port" | sudo tee /proc/sys/net/ipv4/ip_unprivileged_port_start >/dev/null \
+        || return 1
+    ok "unprivileged-port floor lowered to $port (durable via $f)"
+}
+
+_dash_checkout_pin() {
+    command -v git >/dev/null 2>&1 || die "git is required (sudo apt install git)"
+    if [[ -d "$DASH_SRC/.git" ]]; then
+        git -C "$DASH_SRC" fetch --quiet origin 2>/dev/null \
+            || warn "git fetch failed — building from the existing clone"
+    else
+        info "cloning $DASHBOARD_REPO"
+        git clone --quiet "$DASHBOARD_REPO" "$DASH_SRC" \
+            || die "git clone failed: $DASHBOARD_REPO"
+    fi
+    # ALWAYS the pinned commit, never a branch tip: this is third-party
+    # unreviewed PHP served on the LAN; a newer pin only arrives via 'svx
+    # self-update' replacing the DASHBOARD_PIN constant.
+    git -C "$DASH_SRC" checkout --quiet --detach "$DASHBOARD_PIN" \
+        || die "pinned commit $DASHBOARD_PIN not found in the clone — 'git -C $DASH_SRC fetch' and retry"
+}
+
+_dash_seed_configs() {
+    mkdir -p "$DASH_STATE"
+    # Seeded ONLY if absent — these files are operator-owned after first
+    # write; a dashboard update must never clobber a tuned config.
+    if [[ ! -f "$DASH_STATE/config.php" ]]; then
+        [[ -f "$PAYLOAD_DIR/dashboard/config.php.tmpl" ]] \
+            || die "payload missing (dashboard/config.php.tmpl) — run 'svx self-update'"
+        local callsign sysop_name tz
+        callsign=$(sed -n 's/^CALLSIGN=//p' "$ETC_DIR/svxlink.conf" 2>/dev/null | head -1 || true)
+        # The template's $SYSOPNAME: prefer the EchoLink sysop name the seed
+        # step recorded; fall back to the callsign rather than a placeholder.
+        sysop_name=$(sed -n 's/^SYSOPNAME=//p' "$ETC_DIR/svxlink.d/ModuleEchoLink.conf" 2>/dev/null | head -1 || true)
+        tz=$(cat /etc/timezone 2>/dev/null || true)
+        if [[ -z "$tz" ]]; then
+            # Non-Debian layout: derive from the /etc/localtime symlink.
+            tz=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || true)
+        fi
+        # `|` as the sed delimiter: an IANA TZ contains '/'. Every __SVX_*__
+        # placeholder in config.php.tmpl must be substituted here — a leftover
+        # placeholder renders literally in the dashboard header (the TZ
+        # define is the only one with an in-template fallback). QTH and the
+        # frequencies seed empty (the dashboard hides empty values); the
+        # operator tunes them in ~/.svxlink/dashboard/config.php.
+        sed -e "s|__SVX_SUBTITLE__|SvxLink Node|g" \
+            -e "s|__SVX_QTH__||g" \
+            -e "s|__SVX_FREQ_RX__||g" \
+            -e "s|__SVX_FREQ_TX__||g" \
+            -e "s|__SVX_SYSOP__|${callsign:-N0CALL}|g" \
+            -e "s|__SVX_SYSOP_NAME__|${sysop_name:-${callsign:-N0CALL}}|g" \
+            -e "s|__SVX_TZ__|${tz:-UTC}|g" \
+            "$PAYLOAD_DIR/dashboard/config.php.tmpl" >"$DASH_STATE/config.php"
+        # Tripwire for template/CLI drift: no placeholder may survive seeding.
+        if grep -q '__SVX_[A-Z_]*__' "$DASH_STATE/config.php"; then
+            warn "unsubstituted placeholder in $DASH_STATE/config.php — template/CLI drift, edit the file by hand"
+        fi
+    fi
+    if [[ ! -f "$DASH_STATE/dash_config.php" ]]; then
+        cp "$PAYLOAD_DIR/dashboard/dash_config.php.seed" "$DASH_STATE/dash_config.php" \
+            || die "payload missing (dashboard/dash_config.php.seed) — run 'svx self-update'"
+    fi
+    if [[ ! -f "$DASH_STATE/talkgroups.json" ]]; then
+        cp "$PAYLOAD_DIR/dashboard/talkgroups.json.seed" "$DASH_STATE/talkgroups.json" \
+            || die "payload missing (dashboard/talkgroups.json.seed) — run 'svx self-update'"
+    fi
+    refresh_dashboard_echolink_copy
+}
+
+_dash_build() {
+    [[ -f "$PAYLOAD_DIR/dashboard/Containerfile" ]] \
+        || die "payload missing (dashboard/Containerfile) — run 'svx self-update'"
+    info "building $DASH_IMAGE locally (the dashboard has no license — never pushed)"
+    podman build -t "$DASH_IMAGE" -f "$PAYLOAD_DIR/dashboard/Containerfile" "$DASH_SRC"
+}
+
+_dash_render_quadlet() {
+    local template="$PAYLOAD_DIR/svxlink-dashboard.container.template"
+    [[ -f "$template" ]] \
+        || die "payload missing (svxlink-dashboard.container.template) — run 'svx self-update'"
+    local bind="${SVX_DASH_BIND:-}" port="${SVX_DASH_PORT:-}"
+    # A re-render keeps the live choice unless env overrides it.
+    if [[ -f "$DASH_QUADLET" ]]; then
+        bind=${bind:-$(svx_dash_bind)}
+        port=${port:-$(svx_dash_port)}
+    fi
+    if [[ -t 0 && ( -z "$bind" || -z "$port" ) ]]; then
+        local p b
+        if ! read -r -p "Dashboard port [8080]: " p; then p=""; fi
+        port=${port:-${p:-8080}}
+        echo "Bind address: 0.0.0.0 makes the dashboard reachable from the whole"
+        echo "LAN (it has NO authentication); 127.0.0.1 restricts it to this host"
+        echo "(put a reverse proxy in front for remote access)."
+        if ! read -r -p "Bind [0.0.0.0]: " b; then b=""; fi
+        bind=${bind:-${b:-0.0.0.0}}
+    fi
+    bind=${bind:-0.0.0.0}
+    port=${port:-8080}
+    [[ "$port" =~ ^[0-9]+$ ]] || die "port must be numeric: $port"
+    if (( port < 1024 )); then
+        _ensure_unprivileged_port_floor "$port" || exit 1
+    fi
+    snapshot_file "$DASH_QUADLET" \
+        || die "could not snapshot the dashboard Quadlet — refusing to overwrite"
+    local tmp
+    tmp=$(mktemp "${DASH_QUADLET}.XXXXXX") || die "mktemp failed"
+    # Plain sed is safe here: bind is an IP literal and port is numeric.
+    sed -e "s|__DASH_BIND__|${bind}|g" -e "s|__DASH_PORT__|${port}|g" \
+        "$template" >"$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$DASH_QUADLET"
+    systemctl --user daemon-reload || true
+}
+
+_dash_url() {
+    local bind port host
+    bind=$(svx_dash_bind)
+    port=$(svx_dash_port)
+    if [[ "$bind" == "0.0.0.0" ]]; then
+        host=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+        host=${host:-127.0.0.1}
+    else
+        host=$bind
+    fi
+    printf 'http://%s:%s/' "$host" "$port"
+}
+
+cmd_dashboard() {
+    local sub="${1:-status}"
+    if [[ $# -gt 0 ]]; then shift; fi
+    case "$sub" in
+        install)
+            [[ -f "$ETC_DIR/svxlink.conf" ]] \
+                || die "no node config at $ETC_DIR — install the node first"
+            # --image REF: use a pre-built dashboard image instead of
+            # cloning+building here. Real use case: build once on a fast
+            # box, `podman save | ssh pi podman load`, install with
+            # --image on a Pi Zero where the php build is painfully slow.
+            # The license constraint is unchanged — the image travels
+            # privately, it is still never pushed to a registry. The ref
+            # is re-tagged to the canonical :local name so every other
+            # code path (quadlet Image=, update, remove) stays identical.
+            local prebuilt=""
+            if [[ "${1:-}" == "--image" ]]; then
+                prebuilt="${2:-}"
+                [[ -n "$prebuilt" ]] || die "--image needs a reference"
+            fi
+            if [[ -n "$prebuilt" ]]; then
+                podman image exists "$prebuilt" \
+                    || die "image not found in local storage: $prebuilt (podman load it first)"
+                _dash_seed_configs
+                podman tag "$prebuilt" "$DASH_IMAGE"
+                info "using pre-built dashboard image: $prebuilt"
+            else
+                _dash_checkout_pin
+                _dash_seed_configs
+                _dash_build || die "dashboard image build failed (nothing was started)"
+            fi
+            _dash_render_quadlet
+            systemctl --user start svxlink-dashboard.service 2>/dev/null || true
+            if ! unit_recovered_within svxlink-dashboard.service 180; then
+                err "svxlink-dashboard did not come up:"
+                capture_unit_failure svxlink-dashboard.service
+                exit 1
+            fi
+            if ! wait_for_http "http://127.0.0.1:$(svx_dash_port)/" 60; then
+                warn "dashboard unit is active but HTTP does not answer yet — check 'svx logs --dashboard'"
+            fi
+            echo
+            ok "dashboard running: $(_dash_url)"
+            echo "[WARN] The dashboard has NO authentication. Keep it on the LAN;"
+            echo "       NEVER port-forward it to the internet."
+            echo "[i] License note: the dashboard source carries no license, so its"
+            echo "    image is built locally on this host and must never be pushed"
+            echo "    to a registry."
+            ;;
+        update)
+            dashboard_installed || die "dashboard not installed — 'svx dashboard install'"
+            _dash_checkout_pin
+            # A build failure leaves the RUNNING dashboard untouched: the
+            # :local tag only moves when the build succeeds.
+            _dash_build || die "dashboard image build failed — the running dashboard is unchanged"
+            refresh_dashboard_echolink_copy
+            systemctl --user restart svxlink-dashboard.service 2>/dev/null || true
+            if ! unit_recovered_within svxlink-dashboard.service 120; then
+                err "svxlink-dashboard did not come back:"
+                capture_unit_failure svxlink-dashboard.service
+                exit 1
+            fi
+            ok "dashboard updated: $(_dash_url)"
+            ;;
+        remove)
+            systemctl --user stop svxlink-dashboard.service 2>/dev/null || true
+            if [[ -f "$DASH_QUADLET" ]]; then
+                snapshot_file "$DASH_QUADLET" || warn "could not snapshot the dashboard Quadlet"
+                rm -f "$DASH_QUADLET"
+            fi
+            systemctl --user daemon-reload || true
+            podman rm -f svxlink-dashboard 2>/dev/null || true
+            podman rmi "$DASH_IMAGE" 2>/dev/null || true
+            ok "dashboard removed."
+            echo "[i] Kept (reused on the next install): $DASH_STATE (configs),"
+            echo "    $DASH_SRC (source clone)"
+            ;;
+        status)
+            if ! dashboard_installed; then
+                echo "dashboard: not installed ('svx dashboard install' to add it)"
+                return 0
+            fi
+            if systemctl --user is-active --quiet svxlink-dashboard.service 2>/dev/null; then
+                echo "unit:  active"
+            else
+                echo "unit:  NOT active"
+            fi
+            if curl -fsS -m 3 -o /dev/null "http://127.0.0.1:$(svx_dash_port)/" 2>/dev/null; then
+                echo "http:  answering at $(_dash_url)"
+            else
+                echo "http:  NOT answering on port $(svx_dash_port)"
+            fi
+            ;;
+        *)
+            err "Unknown dashboard subcommand: $sub (use install|update|remove|status)"
+            return 1
+            ;;
+    esac
+}
+
+# --- lifecycle --------------------------------------------------------------
+# The CLI owns durable stop/start directly (ADR: no updater engine). Quadlet
+# GENERATED units live under /run/systemd/generator and some systemd
+# versions refuse `disable`/`enable` on them ("transient or generated") —
+# masking is the reliable off-switch there (a ~/.config/systemd/user symlink
+# to /dev/null overrides the generator), so each verb tries the standard
+# path first and falls back to mask/unmask.
+_svx_boot_off() {
+    local unit=$1
+    if ! systemctl --user disable --now "$unit" 2>/dev/null; then
+        systemctl --user mask --now "$unit" 2>/dev/null \
+            || systemctl --user stop "$unit" 2>/dev/null || true
+    fi
+}
+
+_svx_boot_on() {
+    local unit=$1
+    systemctl --user unmask "$unit" 2>/dev/null || true
+    systemctl --user daemon-reload 2>/dev/null || true
+    if ! systemctl --user enable --now "$unit" 2>/dev/null; then
+        systemctl --user start "$unit" 2>/dev/null || return 1
+    fi
+}
+
+cmd_restart() {
+    # A restart of a STOPPED server would start it, silently undoing a
+    # durable 'svx stop' for this boot — an inconsistent state that is
+    # nobody's intent. Refuse and point at start.
+    if ! systemctl --user is-active --quiet svxlink-server.service 2>/dev/null; then
+        err "svxlink-server is not running, so there is nothing to restart."
+        err "Start it with: svx start"
+        exit 1
+    fi
+    echo "Restarting svxlink-server..."
+    _svx_restart_server || exit 1
+    if dashboard_installed; then
+        # try-restart: bounce the dashboard only if it was running.
+        systemctl --user try-restart svxlink-dashboard.service 2>/dev/null || true
+    fi
+}
+
+cmd_stop() {
+    local durable=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --durable) durable=true; shift ;;
+            *) err "Unknown stop argument: $1"; return 1 ;;
+        esac
+    done
+    if [[ "$durable" == true ]]; then
+        echo "Stopping svxlink-server durably (stays down across reboots)..."
+        _svx_boot_off svxlink-server.service
+        if dashboard_installed; then
+            _svx_boot_off svxlink-dashboard.service
+        fi
+        ok "stopped. Resume (and re-arm boot start) with: svx start"
+        return 0
+    fi
+    echo "Stopping svxlink-server..."
+    systemctl --user stop svxlink-server.service 2>/dev/null || true
+    if dashboard_installed; then
+        systemctl --user stop svxlink-dashboard.service 2>/dev/null || true
+    fi
+    ok "stopped for THIS boot only — it starts again at the next reboot."
+    echo "[i] To keep it down across reboots: svx stop --durable"
+}
+
+cmd_start() {
+    echo "Starting svxlink-server..."
+    if ! _svx_boot_on svxlink-server.service; then
+        err "could not start svxlink-server:"
+        capture_unit_failure svxlink-server.service
+        exit 1
+    fi
+    if dashboard_installed; then
+        _svx_boot_on svxlink-dashboard.service || warn "dashboard did not start — 'svx dashboard status'"
+    fi
+    ok "started. Check it with: svx health"
+}
+
+cmd_recover() {
+    if [[ ! -x "$HOME/.local/bin/svx-recovery" ]]; then
+        err "\$HOME/.local/bin/svx-recovery is missing; run 'svx self-update' or re-run the installer"
+        exit 1
+    fi
+    exec "$HOME/.local/bin/svx-recovery" "$@"
+}
+
+# --- bug-report -------------------------------------------------------------
+cmd_bug_report() {
+    # Default output dir is $HOME (not /tmp): a headless repeater's operator
+    # typically scp's the tarball off the box, and /tmp is tmpfs on many
+    # hosts — a reboot between "create" and "fetch" would lose the bundle.
+    local tarball_dir="$HOME"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --to)
+                [[ -n "${2:-}" ]] || { err "--to requires a directory argument"; return 1; }
+                tarball_dir="$2"
+                shift 2
+                ;;
+            --to=*)
+                tarball_dir="${1#--to=}"
+                shift
+                ;;
+            *)
+                err "Unknown bug-report argument: $1"
+                return 1
+                ;;
+        esac
+    done
+    # `--` so a directory name starting with '-' is an operand, not an option.
+    mkdir -p -- "$tarball_dir" 2>/dev/null || die "cannot create output directory $tarball_dir"
+    [[ -w "$tarball_dir" ]] || die "output directory $tarball_dir is not writable"
+
+    local stamp outdir bundle
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    outdir=$(mktemp -d -t svxlink-bug-report.XXXXXX)
+    bundle="$outdir/svxlink-bug-report-$stamp"
+    mkdir -p "$bundle"
+    # Cap on every `podman logs` call: the journald log driver makes
+    # `podman logs --tail N` scan the whole journal regardless of N, so a
+    # chatty container would otherwise dominate the collection time.
+    local timeout_cmd=""
+    command -v timeout >/dev/null 2>&1 && timeout_cmd="timeout 10"
+
+    echo "[i] Collecting diagnostics into $bundle"
+
+    {
+        echo "=== svx version ==="
+        echo "installer: $SVX_VERSION"
+        echo
+        echo "=== uname -a ==="
+        uname -a 2>&1 || true
+        echo
+        echo "=== /etc/os-release ==="
+        cat /etc/os-release 2>&1 || true
+        echo
+        echo "=== date / uptime ==="
+        date -u 2>&1 || true
+        uptime 2>&1 || true
+    } >"$bundle/host.txt" 2>&1
+
+    {
+        echo "=== podman --version ==="
+        podman --version 2>&1 || true
+        echo
+        echo "=== podman info ==="
+        podman info 2>&1 || true
+        echo
+        echo "=== podman ps -a (svxlink-) ==="
+        podman ps -a --filter 'name=svxlink-' \
+            --format '{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.CreatedAt}}' 2>&1 || true
+        echo
+        echo "=== podman images (svxlink) ==="
+        podman images --format '{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Created}}' 2>&1 \
+            | grep -i svxlink || true
+    } >"$bundle/runtime.txt" 2>&1
+
+    # Per-container inspect + logs. `podman logs` is the authoritative
+    # source, not `journalctl --user -u`: rootless podman/conmon writes the
+    # container's stdout/stderr to the journal under the CONTAINER
+    # identifier, which the per-unit journal query does NOT surface (on a
+    # typical Pi it returns "No journal files were found") — so the actual
+    # svxlink startup output only lives here.
+    mkdir -p "$bundle/containers"
+    local ctr
+    while IFS= read -r ctr; do
+        [[ -n "$ctr" ]] || continue
+        if command -v jq >/dev/null 2>&1; then
+            # Redact env VALUES, keep keys: our containers carry no secrets
+            # in env today, but a hand-edited Quadlet could, and keys alone
+            # already show what the container expected.
+            podman inspect "$ctr" 2>/dev/null \
+                | jq 'map(.Config.Env |= (if . == null then null
+                        else map(sub("(?<k>^[^=]+)=.*"; "\(.k)=<redacted>")) end))' \
+                >"$bundle/containers/${ctr}.inspect.json" 2>&1 \
+                || echo "(podman inspect or jq failed for $ctr)" \
+                    >"$bundle/containers/${ctr}.inspect.json"
+        else
+            echo "(jq not installed; skipping inspect dump to avoid leaking env values)" \
+                >"$bundle/containers/${ctr}.inspect.json"
+        fi
+        # SC2086: $timeout_cmd is empty or two words, unquoted on purpose.
+        # shellcheck disable=SC2086
+        $timeout_cmd podman logs --tail 50 "$ctr" \
+            >"$bundle/containers/${ctr}.log" 2>&1 || true
+    done < <(podman ps -a --filter 'name=svxlink-' --format '{{.Names}}' 2>/dev/null || true)
+
+    # Config tree with secrets redacted. PASSWORD= (EchoLink) and AUTH_KEY=
+    # (reflector) are the two secret-bearing keys in the svxlink config
+    # family; values are replaced, keys kept so a reviewer sees what is set.
+    if [[ -d "$ETC_DIR" ]]; then
+        local rel
+        while IFS= read -r rel; do
+            mkdir -p "$bundle/etc/$(dirname "$rel")"
+            sed -e 's/^\([[:space:]]*PASSWORD[[:space:]]*=\).*/\1<redacted>/' \
+                -e 's/^\([[:space:]]*AUTH_KEY[[:space:]]*=\).*/\1<redacted>/' \
+                "$ETC_DIR/$rel" >"$bundle/etc/$rel" 2>/dev/null || true
+        done < <(cd "$ETC_DIR" && find . -type f | sed 's|^\./||')
+    fi
+
+    if [[ -f "$HW_FILE" ]]; then
+        cp "$HW_FILE" "$bundle/hardware.json" 2>/dev/null || true
+    fi
+
+    # The "why didn't the wizard see my device" file.
+    {
+        echo "=== aplay -l ==="
+        aplay -l 2>&1 || true
+        echo
+        echo "=== /proc/asound/cards ==="
+        cat /proc/asound/cards 2>&1 || true
+        echo
+        echo "=== ls -l /dev/snd ==="
+        ls -l /dev/snd 2>&1 || echo "(absent)"
+        echo
+        # Capture once and branch on emptiness rather than `ls || echo`:
+        # the naive form fires the placeholder whenever ANY glob is
+        # unmatched, even when another matched.
+        echo "=== /dev/hidraw* ==="
+        local hid_list
+        hid_list=$(ls -l /dev/hidraw* 2>/dev/null || true)
+        if [[ -n "$hid_list" ]]; then printf '%s\n' "$hid_list"; else echo "(no hidraw devices)"; fi
+        echo
+        echo "=== /dev/gpiochip* ==="
+        local gpio_list
+        gpio_list=$(ls -l /dev/gpiochip* 2>/dev/null || true)
+        if [[ -n "$gpio_list" ]]; then printf '%s\n' "$gpio_list"; else echo "(no gpiochip devices)"; fi
+        echo
+        echo "=== /dev/serial/by-id ==="
+        ls -l /dev/serial/by-id/ 2>&1 || echo "(absent — no USB serial enumerated)"
+        echo
+        echo "=== /dev/svxlink-ptt ==="
+        ls -l /dev/svxlink-ptt 2>&1 || echo "(absent)"
+        echo
+        echo "=== $UDEV_RULE_FILE ==="
+        cat "$UDEV_RULE_FILE" 2>&1 || echo "(absent)"
+        echo
+        # Host audio stack: an active pipewire/pulseaudio holding the card
+        # is the #1 "no audio in the container" cause.
+        echo "=== host audio daemon states ==="
+        local u
+        for u in pipewire pipewire.socket wireplumber pulseaudio pulseaudio.socket; do
+            printf '%-20s %s\n' "$u" "$(systemctl --user is-active "$u" 2>/dev/null || true)"
+        done
+        echo
+        echo "=== wireplumber per-card ignore (if written by svx audio) ==="
+        cat "$HOME/.config/wireplumber/wireplumber.conf.d/50-svxlink-reserve.conf" 2>&1 \
+            || echo "(absent)"
+    } >"$bundle/audio-and-devices.txt" 2>&1
+
+    {
+        echo "=== tail -n 500 $LOG_FILE ==="
+        tail -n 500 "$LOG_FILE" 2>&1 || echo "(no log file)"
+        echo
+        echo "=== rotation sibling ==="
+        ls -l "${LOG_FILE}.1" 2>&1 || echo "(no .1 — not rotated yet)"
+    } >"$bundle/svxlink-log.txt" 2>&1
+
+    mkdir -p "$bundle/quadlets"
+    local un
+    for un in "${UNITS[@]}"; do
+        if [[ -f "$QUADLET_DIR/${un}.container" ]]; then
+            cp "$QUADLET_DIR/${un}.container" "$bundle/quadlets/${un}.container" 2>/dev/null || true
+        fi
+    done
+
+    {
+        echo "=== last-good.json ==="
+        cat "$LAST_GOOD" 2>&1 || echo "(missing)"
+        echo
+        echo "=== snapshot file listing ==="
+        ls -la "$SNAP_DIR" 2>&1 || echo "(no snapshots)"
+    } >"$bundle/snapshots.txt" 2>&1
+
+    if [[ -f "$SVX_HOME/install.log" ]]; then
+        cp "$SVX_HOME/install.log" "$bundle/install.log" 2>/dev/null || true
+    fi
+
+    {
+        echo "=== systemctl --user list-unit-files svxlink-* ==="
+        systemctl --user list-unit-files 'svxlink-*' 2>&1 || true
+        echo
+        echo "=== systemctl --user list-units svxlink-* (incl. inactive) ==="
+        systemctl --user list-units --all 'svxlink-*' 2>&1 || true
+        echo
+        for un in "${UNITS[@]}"; do
+            echo "=== systemctl --user status -l ${un}.service ==="
+            systemctl --user status -l --no-pager "${un}.service" 2>&1 || true
+            echo
+        done
+        echo "=== systemd-analyze --user blame (top 15) ==="
+        systemd-analyze --user blame 2>&1 | head -15 || true
+        echo
+        echo "=== loginctl show-user (Linger) ==="
+        loginctl show-user "$USER" -p Linger 2>&1 || true
+    } >"$bundle/systemd.txt" 2>&1
+
+    {
+        # Filtered first (warn+err only), then a raw tail for "what just
+        # happened" context. Rootless dmesg is restricted on Debian
+        # (kernel.dmesg_restrict=1); best-effort with a clear placeholder.
+        echo "=== dmesg --level=err,warn (last 200) ==="
+        if dmesg --level=err,warn --notime 2>/dev/null | tail -1 >/dev/null 2>&1; then
+            dmesg -T --level=err,warn 2>&1 | tail -200 || true
+        else
+            echo "(dmesg restricted to root on this host — try 'sudo dmesg' manually)"
+        fi
+        echo
+        echo "=== dmesg (last 100, unfiltered tail) ==="
+        if dmesg --notime 2>/dev/null | tail -1 >/dev/null 2>&1; then
+            dmesg -T 2>&1 | tail -100 || true
+        else
+            echo "(dmesg restricted to root on this host)"
+        fi
+    } >"$bundle/dmesg.txt" 2>&1
+
+    local tarball="$tarball_dir/svxlink-bug-report-$stamp.tar.gz"
+    tar -C "$outdir" -czf "$tarball" "svxlink-bug-report-$stamp"
+    rm -rf "$outdir"
+
+    echo
+    ok "Bundle ready:"
+    echo "  $tarball"
+    echo
+    echo "EchoLink PASSWORD= and reflector AUTH_KEY= values are redacted; container"
+    echo "env values are redacted (keys preserved). The device listings and dmesg"
+    echo "output may contain MAC addresses and filesystem paths — review the"
+    echo "tarball before sharing on a public issue tracker."
+}
+
+# --- self-update ------------------------------------------------------------
+_selfupdate_dest() {
+    # Maps a repo-relative manifest path to "dest mode". Rendered artifacts
+    # (Pages already substituted __SVX_VERSION__) go to ~/.local/bin; the
+    # rest refreshes the staged payload.
+    case "$1" in
+        installer/linux/svx.tmpl)          echo "$HOME/.local/bin/svx 0755" ;;
+        installer/linux/svx-recovery.tmpl) echo "$HOME/.local/bin/svx-recovery 0755" ;;
+        installer/linux/lib/*)             echo "$PAYLOAD_DIR/lib/${1##*/} 0755" ;;
+        installer/linux/*)                 echo "$PAYLOAD_DIR/${1##*/} 0755" ;;
+        quadlets/*)                        echo "$PAYLOAD_DIR/${1##*/} 0644" ;;
+        dashboard/*)                       echo "$PAYLOAD_DIR/dashboard/${1##*/} 0644" ;;
+        *)                                 echo "" ;;
+    esac
+}
+
+cmd_self_update() {
+    local base="${SVX_INSTALLER_BASE:-$DEFAULT_BASE}"
+    info "fetching installer artifacts from $base"
+    local tmpdir
+    tmpdir=$(mktemp -d -t svx-self-update.XXXXXX) || die "mktemp failed"
+
+    # Phase 1: fetch + syntax-check EVERYTHING before installing ANYTHING —
+    # a partial refresh (some files new, some old) is worse than none.
+    local staged=() dests=() modes=()
+    local path pair dest mode url tmp
+    for path in "${SELFUPDATE_FILES[@]}"; do
+        pair=$(_selfupdate_dest "$path")
+        if [[ -z "$pair" ]]; then
+            err "no destination mapping for manifest entry '$path' (bug)"
+            rm -rf "$tmpdir"
+            return 1
+        fi
+        dest=${pair% *}
+        mode=${pair##* }
+        url="$base/$path"
+        tmp="$tmpdir/$(printf '%s' "$path" | tr '/' '_')"
+        if ! curl -fsSL -m 120 -o "$tmp" "$url"; then
+            err "fetch failed: $url"
+            err "Recovery floor — the idempotent installer one-liner re-lays everything:"
+            err "  curl -fsSL $base/installer/linux/install.sh | bash"
+            rm -rf "$tmpdir"
+            return 1
+        fi
+        # Syntax-check every shell artifact BEFORE it can replace a working
+        # copy — a truncated download must never brick ~/.local/bin/svx.
+        case "$dest" in
+            */svx|*/svx-recovery|*.sh)
+                if ! bash -n "$tmp" 2>/dev/null; then
+                    err "fetched $path fails 'bash -n' — refusing the whole refresh"
+                    rm -rf "$tmpdir"
+                    return 1
+                fi
+                ;;
+        esac
+        staged+=("$tmp")
+        dests+=("$dest")
+        modes+=("$mode")
+    done
+
+    # Phase 2: install with a byte-compare report. Self-replacement of this
+    # very script is safe: bash keeps reading from the old inode's fd.
+    # Sibling temp + mv (not mv from the tmpfs dir) so each install is an
+    # atomic rename on the destination filesystem.
+    local i changed=0 unchanged=0 stage2
+    for i in "${!staged[@]}"; do
+        dest=${dests[$i]}
+        mkdir -p "$(dirname "$dest")"
+        if cmp -s "${staged[$i]}" "$dest" 2>/dev/null; then
+            unchanged=$((unchanged + 1))
+            continue
+        fi
+        stage2=$(mktemp "${dest}.XXXXXX") || { rm -rf "$tmpdir"; die "mktemp failed for $dest"; }
+        if ! cp "${staged[$i]}" "$stage2" || ! chmod "${modes[$i]}" "$stage2" \
+            || ! mv -f "$stage2" "$dest"; then
+            rm -f "$stage2"
+            rm -rf "$tmpdir"
+            die "failed to install $dest"
+        fi
+        echo "  updated: $dest"
+        changed=$((changed + 1))
+    done
+    rm -rf "$tmpdir"
+    ok "self-update complete: $changed updated, $unchanged unchanged."
+
+    # A template-only fix staged into the payload never reaches the LIVE
+    # Quadlet on its own — chain the render (idempotent; restart is the
+    # operator's move).
+    cmd_render_server --no-restart || true
+    if (( changed > 0 )); then
+        echo "[i] Re-run svx to use the new version."
+    fi
+}
+
+cmd_uninstall() {
+    echo "Stopping svxlink-* units..."
+    local un
+    for un in "${UNITS[@]}"; do
+        systemctl --user stop "${un}.service" 2>/dev/null || true
+    done
+
+    echo "Removing Quadlet files (snapshotted first)..."
+    for un in "${UNITS[@]}"; do
+        if [[ -f "$QUADLET_DIR/${un}.container" ]]; then
+            snapshot_file "$QUADLET_DIR/${un}.container" || true
+            rm -f "$QUADLET_DIR/${un}.container"
+        fi
+    done
+
+    echo "Removing resolv-watch units..."
+    systemctl --user disable --now svxlink-resolv-watch.path 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/svxlink-resolv-watch.path" \
+          "$HOME/.config/systemd/user/svxlink-resolv-watch.service"
+    # A unit that failed before its file was removed lingers in the manager
+    # as "not-found failed" until reset — cosmetic, but it pollutes every
+    # later `systemctl --user list-units` (seen in the e2e harness).
+    systemctl --user reset-failed 'svxlink-*' 2>/dev/null || true
+
+    echo "Removing podman containers..."
+    for un in "${UNITS[@]}"; do
+        if podman container exists "$un" 2>/dev/null; then
+            podman rm -f "$un" 2>/dev/null || true
+        fi
+    done
+    # Only the locally built dashboard image is removed; the pulled server
+    # images stay — they are the rollback inventory.
+    podman rmi "$DASH_IMAGE" 2>/dev/null || true
+
+    systemctl --user daemon-reload || true
+
+    echo
+    echo "Preserved (intentional):"
+    echo "  ~/.svxlink/                 — configs, logs, sounds, snapshots, payload"
+    echo "  pulled svxlink-server images — rollback inventory (podman images)"
+    echo "  $UDEV_RULE_FILE — PTT udev rule"
+    echo "  /etc/systemd/journald.conf.d/svxlink.conf — journald limits"
+    echo "  ~/.local/bin/svx, ~/.local/bin/svx-recovery — this command + safety net"
+    echo
+    echo "To purge ALL of it, run:"
+    echo "  rm -rf ~/.svxlink"
+    echo "  rm -f  ~/.local/bin/svx ~/.local/bin/svx-recovery"
+    echo "  sudo rm -f /usr/local/bin/svx $UDEV_RULE_FILE \\"
+    echo "         /etc/systemd/journald.conf.d/svxlink.conf \\"
+    echo "         /etc/sysctl.d/80-svxlink-unprivileged-ports.conf"
+    echo "  podman rmi \$(podman images -q 'ghcr.io/dirkwa/svxlink-server')"
+    echo "Done."
+}
+
+case "${1:-help}" in
+    health)        cmd_health ;;
+    update)        shift; cmd_update "$@" ;;
+    channel)       shift; cmd_channel "$@" ;;
+    logs)          shift; cmd_logs "$@" ;;
+    config)        shift; cmd_config "$@" ;;
+    audio)         shift; cmd_audio "$@" ;;
+    ptt)           shift; cmd_ptt "$@" ;;
+    sounds)        shift; cmd_sounds "$@" ;;
+    render-server) shift; cmd_render_server "$@" ;;
+    dashboard)     shift; cmd_dashboard "$@" ;;
+    restart)       cmd_restart ;;
+    stop)          shift; cmd_stop "$@" ;;
+    start)         cmd_start ;;
+    recover)       shift; cmd_recover "$@" ;;
+    resolv-watch)  shift; cmd_resolv_watch "$@" ;;
+    bug-report)    shift; cmd_bug_report "$@" ;;
+    self-update)   cmd_self_update ;;
+    uninstall)     cmd_uninstall ;;
+    version|--version|-v) cmd_version ;;
+    help|--help|-h) usage ;;
+    *)
+        err "Unknown command: $1"
+        usage
+        exit 1
+        ;;
+esac
