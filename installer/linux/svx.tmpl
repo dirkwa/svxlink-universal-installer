@@ -382,10 +382,22 @@ _fmt_age() {
     fi
 }
 
+# A crashloop that exhausted StartLimitBurst leaves the unit failed in a
+# start-limit state for up to StartLimitIntervalSec (30 min); systemd then
+# rejects even DELIBERATE starts with "Start request repeated too quickly"
+# — the exact trap of restarting right after fixing a crashloop's root
+# cause (bit the Pi 4 re-install: audio fix in place, start refused
+# anyway). Clearing the counter before an operator-initiated start is
+# safe: the guard still protects unattended Restart= cycles.
+reset_start_limit() {
+    systemctl --user reset-failed "$1" 2>/dev/null || true
+}
+
 # Direct systemctl restart with the slow-start tolerance. There is no
 # updater REST API in this stack — the CLI owns lifecycle (ADR: no engine
 # containers).
 _svx_restart_server() {
+    reset_start_limit svxlink-server.service
     systemctl --user restart svxlink-server.service 2>/dev/null || true
     if unit_recovered_within svxlink-server.service 120; then
         ok "svxlink-server restarted."
@@ -693,6 +705,7 @@ cmd_update() {
     base_size=${base_stat#* }
 
     systemctl --user daemon-reload || true
+    reset_start_limit svxlink-server.service
     systemctl --user restart svxlink-server.service 2>/dev/null || true
 
     if unit_recovered_within svxlink-server.service 120 \
@@ -734,6 +747,9 @@ cmd_update() {
     base_stat=$(log_stat)
     base_inode=${base_stat% *}
     base_size=${base_stat#* }
+    # The failed update attempt above may have burnt the whole restart
+    # burst — without a reset the ROLLBACK restart is itself refused.
+    reset_start_limit svxlink-server.service
     systemctl --user restart svxlink-server.service 2>/dev/null || true
     if unit_recovered_within svxlink-server.service 120 \
         && wait_log_growth "$base_inode" "$base_size" 60 \
@@ -1946,6 +1962,7 @@ cmd_dashboard() {
                 _dash_build || die "dashboard image build failed (nothing was started)"
             fi
             _dash_render_quadlet
+            reset_start_limit svxlink-dashboard.service
             systemctl --user start svxlink-dashboard.service 2>/dev/null || true
             if ! unit_recovered_within svxlink-dashboard.service 180; then
                 err "svxlink-dashboard did not come up:"
@@ -1970,6 +1987,7 @@ cmd_dashboard() {
             # :local tag only moves when the build succeeds.
             _dash_build || die "dashboard image build failed — the running dashboard is unchanged"
             refresh_dashboard_echolink_copy
+            reset_start_limit svxlink-dashboard.service
             systemctl --user restart svxlink-dashboard.service 2>/dev/null || true
             if ! unit_recovered_within svxlink-dashboard.service 120; then
                 err "svxlink-dashboard did not come back:"
@@ -2033,6 +2051,7 @@ _svx_boot_on() {
     local unit=$1
     systemctl --user unmask "$unit" 2>/dev/null || true
     systemctl --user daemon-reload 2>/dev/null || true
+    reset_start_limit "$unit"
     if ! systemctl --user enable --now "$unit" 2>/dev/null; then
         systemctl --user start "$unit" 2>/dev/null || return 1
     fi
