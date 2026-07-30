@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # GitHub Actions is the only ecosystem dependabot can manage in this
+  # repo — the installer is pure bash and has no package manifests. The
+  # dashboard Containerfile's FROM is deliberately not covered: the image
+  # is built locally on target hosts, and a silent base bump would change
+  # what operators build without an installer release.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        update-types:
+          - minor
+          - patch

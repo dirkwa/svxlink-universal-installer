@@ -1,0 +1,88 @@
+name: Publish installer to GitHub Pages
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  workflow_dispatch:
+
+# Native GitHub Pages deploy: upload-pages-artifact + deploy-pages,
+# no third-party action and no gh-pages branch. The repo's Pages source
+# must be set to "GitHub Actions" in Settings -> Pages for this to take
+# effect; a "Deploy from a branch" setting keeps firing the legacy
+# built-in workflow on top of ours.
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Compute installer version
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            v="${GITHUB_REF_NAME#v}"
+          else
+            v="$(git describe --tags --always --dirty 2>/dev/null || echo dev-${GITHUB_SHA::7})"
+            # Strip leading `v` so install.sh's `v${INSTALLER_VERSION}`
+            # doesn't render as `vv0.1.0-NN-gXXXXXXX`. Tag branch already
+            # strips.
+            v="${v#v}"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Stage dist/
+        env:
+          INSTALLER_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp -r installer dist/
+          # quadlets/ and dashboard/ MUST be published: install.sh's fetch
+          # manifest and `svx self-update` pull the quadlet templates, the
+          # dashboard Containerfile, and the dashboard seeds from Pages —
+          # omitting either directory 404s every bootstrap and refresh.
+          cp -r quadlets dist/
+          cp -r dashboard dist/
+          [ -d scripts ] && cp -r scripts dist/
+          [ -d docs ] && cp -r docs dist/
+          cp README.md dist/index.md
+
+          # Inject the version into the shell installers and the *.tmpl
+          # dispatcher templates. The .tmpl files are fetched verbatim by
+          # `svx self-update`, so baking the version in here means
+          # `svx version` reports the same value after a self-update as
+          # after a fresh bootstrap. The bash one-liner's install-time
+          # substitution becomes a no-op against the published artifact
+          # and still works against a local checkout (where the
+          # placeholder is untouched).
+          find dist/installer -type f \( -name '*.sh' -o -name '*.tmpl' \) -print0 |
+            xargs -0 sed -i "s|INSTALLER_VERSION:-0.0.0-scaffold|INSTALLER_VERSION:-${INSTALLER_VERSION}|g; s|'0.0.0-scaffold'|'${INSTALLER_VERSION}'|g; s|__SVX_VERSION__|${INSTALLER_VERSION}|g"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: ./dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v5

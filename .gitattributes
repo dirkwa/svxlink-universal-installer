@@ -1,0 +1,5 @@
+# Force LF line endings on checkout regardless of the host's
+# core.autocrlf setting. Every artifact here is bash/YAML/PHP consumed on
+# Linux; a CRLF checkout turns `bash -n` and shellcheck green files into
+# runtime `\r: command not found` failures when copied from a Windows box.
+* text=auto eol=lf
