@@ -84,28 +84,42 @@ emit_json() {
                 first_capture_card="$id"
                 first_capture_card_pb="$pb"
             fi
-            [[ -z "$first_playback_card" && "$pb" == true ]] && first_playback_card="$id"
+            # Onboard Pi playback (bcm2835 jack, vc4 HDMI) never enters the
+            # TX fallback: bcm2835 ENOTSUPPs svxlink's ALSA setup and HDMI
+            # is no transmitter path — a capture-only USB dongle sitting
+            # next to them must not resurrect the crashloop through the
+            # split-rig fallback. They stay listed in cards[] (an explicit
+            # wizard pick is the operator's call).
+            if [[ -z "$first_playback_card" && "$pb" == true ]] \
+                && ! printf '%s %s' "$id" "$name" | grep -qiE 'bcm2835|vc4[- ]?hdmi'; then
+                first_playback_card="$id"
+            fi
         done <"$PROC_ASOUND/cards"
     fi
 
-    # Default rx = first CAPTURE-capable card. Default tx = the SAME card
-    # when it can also play (the single-USB-radio-interface case — the
-    # overwhelming majority; kernel enumeration order would otherwise route
-    # TX audio to a Pi's headphone jack while RX sits on the USB card),
-    # else the first playback-capable card. A Pi with only onboard audio
-    # gets tx-only and install.sh parks RX=NONE so the node still starts.
-    # Two-card setups pick per-direction in `svx audio`.
+    # Audio defaults are proposed ONLY when a capture-capable card exists —
+    # that card IS the radio interface. rx = that card; tx = the same card
+    # when it can also play (the single-USB-interface case — the
+    # overwhelming majority), else the first playback-capable card
+    # (split-RX/TX rigs). WITHOUT any capture card there is no radio
+    # interface, and both sides stay null so install.sh parks RX and TX:
+    # an earlier revision defaulted TX onto whatever could play, which on
+    # a stock Pi is the onboard bcm2835 headphone jack — whose driver
+    # rejects svxlink's ALSA parameters outright (ENOTSUPP, "Unknown
+    # error 524", second real-Pi 4 crashloop 2026-07-30). Onboard Pi
+    # audio is not a usable svxlink device; do not "improve" this by
+    # proposing it again.
     local rx_json="null" tx_json="null" tx_card=""
     local esc dev
     if [[ -n "$first_capture_card" ]]; then
         esc=$(json_escape "$first_capture_card")
         dev="alsa:plughw:CARD=${esc},DEV=0"
         rx_json="{\"card\":\"${esc}\",\"dev\":\"${dev}\",\"sampleRate\":48000}"
-    fi
-    if [[ -n "$first_capture_card" && "$first_capture_card_pb" == true ]]; then
-        tx_card="$first_capture_card"
-    elif [[ -n "$first_playback_card" ]]; then
-        tx_card="$first_playback_card"
+        if [[ "$first_capture_card_pb" == true ]]; then
+            tx_card="$first_capture_card"
+        elif [[ -n "$first_playback_card" ]]; then
+            tx_card="$first_playback_card"
+        fi
     fi
     if [[ -n "$tx_card" ]]; then
         esc=$(json_escape "$tx_card")
