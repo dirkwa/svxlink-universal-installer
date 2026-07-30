@@ -1051,18 +1051,36 @@ cmd_audio() {
         || die "jq is required for the hardware wizard (sudo apt install jq)"
     [[ -d /proc/asound ]] || die "no ALSA subsystem on this host (/proc/asound missing)"
 
-    local nums=() ids=() d
+    # Per-card stream directions via /proc/asound/card<N>/pcm*{c,p}: a
+    # capture-less card must never be offered for RX — the Pi's onboard
+    # bcm2835/HDMI is playback-only, and Rx1 on it crashloops svxlink
+    # with "Open capture audio device failed" (first real Pi 4 install).
+    local nums=() ids=() caps=() pbs=() d n
     for d in /proc/asound/card[0-9]*; do
         [[ -d "$d" ]] || continue
-        nums+=("${d##*card}")
-        ids+=("$(cat "$d/id" 2>/dev/null || echo "card${d##*card}")")
+        n="${d##*card}"
+        nums+=("$n")
+        ids+=("$(cat "$d/id" 2>/dev/null || echo "card${n}")")
+        if compgen -G "$d/pcm*c" >/dev/null; then caps+=(1); else caps+=(0); fi
+        if compgen -G "$d/pcm*p" >/dev/null; then pbs+=(1); else pbs+=(0); fi
     done
     (( ${#ids[@]} > 0 )) || die "no sound cards detected (is the USB audio device plugged in?)"
+    local have_capture=0
+    local i
+    for i in "${!ids[@]}"; do (( caps[i] )) && have_capture=1; done
+    (( have_capture )) || die "no CAPTURE-capable sound card found — the onboard Pi audio is playback-only; plug in the USB radio interface first"
 
     echo "Detected sound cards:"
-    local i
+    local dir_note
     for i in "${!ids[@]}"; do
-        printf '  %2d) CARD=%s (ALSA card %s)\n' "$((i + 1))" "${ids[$i]}" "${nums[$i]}"
+        dir_note=""
+        if (( ! caps[i] && ! pbs[i] )); then
+            dir_note=" [no capture or playback streams]"
+        else
+            (( caps[i] )) || dir_note=" [playback-only — not selectable for RX]"
+            (( pbs[i] ))  || dir_note=" [capture-only — not selectable for TX]"
+        fi
+        printf '  %2d) CARD=%s (ALSA card %s)%s\n' "$((i + 1))" "${ids[$i]}" "${nums[$i]}" "$dir_note"
     done
     echo
     echo "aplay -l for context:"
@@ -1075,22 +1093,30 @@ cmd_audio() {
     #    internally while most USB codecs only do 44.1/48 kHz natively —
     #    raw hw: fails with a rate mismatch. CARD_SAMPLE_RATE=48000 +
     #    plughw is the combination verified on real CM108 hardware.
-    local pick rx_i tx_i
-    if ! read -r -p "RX (receiver audio in) card [1]: " pick; then pick=""; fi
-    pick=${pick:-1}
-    if [[ ! "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > ${#ids[@]} )); then
-        die "invalid selection: $pick"
-    fi
+    # Default RX = the first CAPTURE-capable card, not blindly card 1.
+    local pick rx_i tx_i rx_default=1
+    for i in "${!ids[@]}"; do
+        if (( caps[i] )); then rx_default=$((i + 1)); break; fi
+    done
+    if ! read -r -p "RX (receiver audio in) card [$rx_default]: " pick; then pick=""; fi
+    pick=${pick:-$rx_default}
+    [[ "$pick" =~ ^[0-9]+$ ]] || die "invalid selection: $pick"
+    # 10# base prefix: bash arithmetic reads a leading zero ("08") as
+    # octal and aborts the range check.
+    pick=$((10#$pick))
+    (( pick >= 1 && pick <= ${#ids[@]} )) || die "invalid selection: $pick"
     rx_i=$((pick - 1))
+    (( caps[rx_i] )) || die "CARD=${ids[$rx_i]} has no capture stream — it cannot be the RX card"
     if ! read -r -p "TX (transmitter audio out) card [Enter = same as RX]: " pick; then pick=""; fi
     if [[ -z "$pick" ]]; then
         tx_i=$rx_i
     else
-        if [[ ! "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > ${#ids[@]} )); then
-            die "invalid selection: $pick"
-        fi
+        [[ "$pick" =~ ^[0-9]+$ ]] || die "invalid selection: $pick"
+        pick=$((10#$pick))
+        (( pick >= 1 && pick <= ${#ids[@]} )) || die "invalid selection: $pick"
         tx_i=$((pick - 1))
     fi
+    (( pbs[tx_i] )) || die "CARD=${ids[$tx_i]} has no playback stream — it cannot be the TX card"
     local rx_id="${ids[$rx_i]}" tx_id="${ids[$tx_i]}"
     local rx_num="${nums[$rx_i]}" tx_num="${nums[$tx_i]}"
 

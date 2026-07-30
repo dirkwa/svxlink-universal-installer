@@ -834,26 +834,62 @@ fi
 printf '%s\n' "$HW_FRESH" >"$SVX_HOME/hardware.json"
 ok "wrote $SVX_HOME/hardware.json (operator choices preserved)"
 
-# No sound card present -> park the active logic on RX=NONE/TX=NONE.
-# The pristine config wires Rx1/Tx1 to alsa:plughw:0; without /dev/snd
-# svxlink exits at startup and the unit crashloops before the operator
-# ever sees a working node (bit the harness e2e; also any real install
-# where the USB sound card is not plugged in yet). Deviceless is a
-# supported svxlink mode; `svx audio` flips the logic back to Rx1/Tx1
-# when a card is configured. Only the untouched defaults are rewritten —
-# an operator's explicit RX/TX choice survives re-runs.
-if ! printf '%s' "$HW_FRESH" | grep -q '"dev":[[:space:]]*"alsa:'; then
-    _active_logic=$(sed -n 's/^LOGICS=//p' "$SVX_HOME/etc/svxlink.conf" 2>/dev/null | head -1 | cut -d, -f1)
-    if [[ -n "$_active_logic" ]]; then
-        _cur_rx=$(sed -n "/^\[$_active_logic\]/,/^\[/{s/^RX=//p}" "$SVX_HOME/etc/svxlink.conf" | head -1)
-        _cur_tx=$(sed -n "/^\[$_active_logic\]/,/^\[/{s/^TX=//p}" "$SVX_HOME/etc/svxlink.conf" | head -1)
-        if [[ "$_cur_rx" == "Rx1" && "$_cur_tx" == "Tx1" ]]; then
-            bash "$HERE/seed-config.sh" set "$SVX_HOME/etc/svxlink.conf" "$_active_logic" RX NONE
-            bash "$HERE/seed-config.sh" set "$SVX_HOME/etc/svxlink.conf" "$_active_logic" TX NONE
-            warn "no sound card detected — node starts audio-less ($_active_logic RX/TX=NONE)."
-            info "After plugging hardware: run 'svx audio' (it re-enables Rx1/Tx1)."
-        fi
+# Park logic sides whose audio HALF is missing. Detection sets audio.rx
+# only from a CAPTURE-capable card and audio.tx only from a
+# playback-capable one — "a card exists" is not "a card can record": a
+# Pi's onboard bcm2835/HDMI is playback-only, and the pristine config's
+# Rx1 on it crashloops svxlink with "Open capture audio device failed"
+# (bit the first real Pi 4 install, 2026-07-30; the all-or-nothing
+# variant of this guard shipped first and missed exactly that case).
+# Parking is PER SIDE: rx-less hosts still announce (TX via the onboard
+# jack), deviceless hosts park both. `svx audio` re-attaches Rx1/Tx1
+# when real hardware is configured. Only the untouched defaults are
+# rewritten — an operator's explicit RX/TX choice survives re-runs.
+_active_logic=$(sed -n 's/^LOGICS=//p' "$SVX_HOME/etc/svxlink.conf" 2>/dev/null | head -1 | cut -d, -f1)
+if [[ -n "$_active_logic" ]]; then
+    _cur_rx=$(sed -n "/^\[$_active_logic\]/,/^\[/{s/^RX=//p}" "$SVX_HOME/etc/svxlink.conf" | head -1)
+    _cur_tx=$(sed -n "/^\[$_active_logic\]/,/^\[/{s/^TX=//p}" "$SVX_HOME/etc/svxlink.conf" | head -1)
+    if ! printf '%s' "$HW_FRESH" | grep -q '"rx": {' && [[ "$_cur_rx" == "Rx1" ]]; then
+        bash "$HERE/seed-config.sh" set "$SVX_HOME/etc/svxlink.conf" "$_active_logic" RX NONE
+        warn "no capture-capable sound card — $_active_logic parked on RX=NONE."
+        info "After plugging the radio interface: run 'svx audio' (re-enables Rx1)."
     fi
+    if ! printf '%s' "$HW_FRESH" | grep -q '"tx": {' && [[ "$_cur_tx" == "Tx1" ]]; then
+        bash "$HERE/seed-config.sh" set "$SVX_HOME/etc/svxlink.conf" "$_active_logic" TX NONE
+        warn "no playback-capable sound card — $_active_logic parked on TX=NONE."
+    fi
+fi
+
+# Apply the detected AUDIO_DEV defaults to the seeded config — parking's
+# other half: the pristine config says alsa:plughw:0, which on a Pi is
+# the playback-only ONBOARD card even when a perfectly good USB radio
+# interface sits at index 1. Only the pristine default is rewritten
+# (never an operator/wizard choice), and only for the side detection
+# actually found — so a fresh install with the USB card already plugged
+# needs zero wizard interaction, the stated design goal. CARD= naming,
+# never the index (USB numbering shifts across boots).
+_hw_dev_for() {
+    # $1 = rx|tx. jq when present (installed in step 5); grep fallback
+    # matches the compact one-line object detect-hardware.sh emits.
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$HW_FRESH" | jq -r ".audio.$1.dev // empty" 2>/dev/null
+    else
+        printf '%s' "$HW_FRESH" | grep -o "\"$1\": {[^}]*}" | grep -o '"dev":"[^"]*"' | head -1 | cut -d'"' -f4
+    fi
+}
+_cur_rx_dev=$(sed -n '/^\[Rx1\]/,/^\[/{s/^AUDIO_DEV=//p}' "$SVX_HOME/etc/svxlink.conf" | head -1)
+_cur_tx_dev=$(sed -n '/^\[Tx1\]/,/^\[/{s/^AUDIO_DEV=//p}' "$SVX_HOME/etc/svxlink.conf" | head -1)
+_det_rx_dev=$(_hw_dev_for rx)
+_det_tx_dev=$(_hw_dev_for tx)
+if [[ -n "$_det_rx_dev" && "$_cur_rx_dev" == "alsa:plughw:0" ]]; then
+    bash "$HERE/seed-config.sh" set "$SVX_HOME/etc/svxlink.conf" Rx1 AUDIO_DEV "$_det_rx_dev"
+    bash "$HERE/seed-config.sh" set "$SVX_HOME/etc/svxlink.conf" Rx1 CARD_SAMPLE_RATE 48000
+    ok "Rx1 audio: $_det_rx_dev (detected; change with 'svx audio')"
+fi
+if [[ -n "$_det_tx_dev" && "$_cur_tx_dev" == "alsa:plughw:0" ]]; then
+    bash "$HERE/seed-config.sh" set "$SVX_HOME/etc/svxlink.conf" Tx1 AUDIO_DEV "$_det_tx_dev"
+    bash "$HERE/seed-config.sh" set "$SVX_HOME/etc/svxlink.conf" Tx1 CARD_SAMPLE_RATE 48000
+    ok "Tx1 audio: $_det_tx_dev (detected; change with 'svx audio')"
 fi
 
 # The interactive audio/PTT wizard is `svx audio` / `svx ptt` — offered
