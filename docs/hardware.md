@@ -34,6 +34,14 @@ current session, but if you added groups manually, reconnect.
 - The whole `/dev/snd` directory is passed through (`AddDevice=/dev/snd`),
   not individual nodes — child nodes recreated on a USB replug stay
   visible.
+- **A Raspberry Pi's onboard audio (bcm2835 headphone jack / HDMI) is not
+  usable for svxlink.** It has no capture side at all, and even for
+  playback the bcm2835 driver rejects svxlink's ALSA parameters
+  (`Open playback audio device failed: Unknown error 524` = ENOTSUPP).
+  Detection therefore proposes audio only when a capture-capable card —
+  the actual radio interface — is present; until one is plugged in, the
+  installer parks the logic on `RX=NONE`/`TX=NONE` and the node runs
+  audio-less. Plug in the USB interface, run `svx audio`, done.
 
 ### PipeWire / PulseAudio conflicts
 
