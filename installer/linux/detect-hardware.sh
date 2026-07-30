@@ -50,9 +50,9 @@ emit_json() {
     # id string is stable. plughw (not raw hw:) so ALSA converts between
     # svxlink's internal 16 kHz and the card's native rate.
     local card_items=()
-    local first_card=""
+    local first_capture_card="" first_capture_card_pb=false first_playback_card=""
     if [[ -r "$PROC_ASOUND/cards" ]]; then
-        local line idx id name id_file
+        local line idx id name id_file cap pb
         while IFS= read -r line; do
             # Card header lines look like:
             #  0 [Device         ]: USB-Audio - USB Audio Device
@@ -70,21 +70,47 @@ emit_json() {
                 id="${id%"${id##*[![:space:]]}"}"   # rtrim
             fi
             name="${BASH_REMATCH[3]}"
-            card_items+=("{\"index\":${idx},\"card\":\"$(json_escape "$id")\",\"name\":\"$(json_escape "$name")\"}")
-            [[ -z "$first_card" ]] && first_card="$id"
+            # Stream direction per card: a pcm<N>c dir = capture stream, a
+            # pcm<N>p dir = playback stream. "A card exists" is NOT "a card
+            # can record": the Pi's onboard bcm2835/HDMI devices are
+            # playback-only, and defaulting Rx1 onto one crashloops svxlink
+            # with "Open capture audio device failed" (bit the first real
+            # Pi 4 install, 2026-07-30).
+            cap=false; pb=false
+            if compgen -G "$PROC_ASOUND/card${idx}/pcm*c" >/dev/null; then cap=true; fi
+            if compgen -G "$PROC_ASOUND/card${idx}/pcm*p" >/dev/null; then pb=true; fi
+            card_items+=("{\"index\":${idx},\"card\":\"$(json_escape "$id")\",\"name\":\"$(json_escape "$name")\",\"capture\":${cap},\"playback\":${pb}}")
+            if [[ -z "$first_capture_card" && "$cap" == true ]]; then
+                first_capture_card="$id"
+                first_capture_card_pb="$pb"
+            fi
+            [[ -z "$first_playback_card" && "$pb" == true ]] && first_playback_card="$id"
         done <"$PROC_ASOUND/cards"
     fi
 
-    # Default rx/tx = the first detected card (single-USB-soundcard nodes —
-    # the overwhelmingly common case — need zero wizard interaction for
-    # audio). Two-card setups pick per-direction in `svx audio`.
-    local rx_json="null" tx_json="null"
-    if [[ -n "$first_card" ]]; then
-        local esc dev
-        esc=$(json_escape "$first_card")
+    # Default rx = first CAPTURE-capable card. Default tx = the SAME card
+    # when it can also play (the single-USB-radio-interface case — the
+    # overwhelming majority; kernel enumeration order would otherwise route
+    # TX audio to a Pi's headphone jack while RX sits on the USB card),
+    # else the first playback-capable card. A Pi with only onboard audio
+    # gets tx-only and install.sh parks RX=NONE so the node still starts.
+    # Two-card setups pick per-direction in `svx audio`.
+    local rx_json="null" tx_json="null" tx_card=""
+    local esc dev
+    if [[ -n "$first_capture_card" ]]; then
+        esc=$(json_escape "$first_capture_card")
         dev="alsa:plughw:CARD=${esc},DEV=0"
         rx_json="{\"card\":\"${esc}\",\"dev\":\"${dev}\",\"sampleRate\":48000}"
-        tx_json="$rx_json"
+    fi
+    if [[ -n "$first_capture_card" && "$first_capture_card_pb" == true ]]; then
+        tx_card="$first_capture_card"
+    elif [[ -n "$first_playback_card" ]]; then
+        tx_card="$first_playback_card"
+    fi
+    if [[ -n "$tx_card" ]]; then
+        esc=$(json_escape "$tx_card")
+        dev="alsa:plughw:CARD=${esc},DEV=0"
+        tx_json="{\"card\":\"${esc}\",\"dev\":\"${dev}\",\"sampleRate\":48000}"
     fi
 
     # --- CM108-family hidraw PTT candidates ------------------------------
