@@ -164,6 +164,13 @@ coordinated with an svxlink-images release.
   `has()`, not `//`.** jq's `//` treats a stored `false` as empty and would
   resurrect an operator's opt-out on the next detection run. Fresh
   `serial[]`/`gpio.chips` lists win (the device set may have changed).
+  **Carried = `ptt`, `squelch`, `audio.hostAudioMitigation` ONLY —
+  `audio.rx/tx` always take the fresh detection.** hardware.json audio is
+  detection output, not OperatorIntent: carrying it froze the first run's
+  (pre-capture-fix) `tx=Headphones` proposal on the Pi 4 and overrode
+  every corrected re-detect, defeating the install-time parking. The
+  operator's real audio choice lives in `svxlink.conf`, where the wizard
+  writes `AUDIO_DEV`.
 - **Sound overrides mount per-language dirs only.** Mounting
   `/usr/share/svxlink` or `.../sounds` wholesale shadows `events.d/*.tcl`
   and the baked `en_US` pack (the f4hlv mistake). One
@@ -184,7 +191,7 @@ Paths this repo's tooling creates and depends on:
 | `~/.svxlink/etc/` | user (0700) | bind-mounted at `/etc/svxlink` (rw): `svxlink.conf`, `svxlink.d/`, `gpio.conf`, `node_info.json`, … | seeded once from the image's pristine tree (`podman create`+`cp`); then operator / `svx config` |
 | `~/.svxlink/log/` | user (files 0644, container-written) | bind-mounted at `/var/log/svxlink` — rw in server, **ro** in dashboard; holds `svxlink` + exactly one `svxlink.1` | svxlink-server container |
 | `~/.svxlink/sounds/<lang>/` | user | per-language voice-pack overrides, each mounted at `/usr/share/svxlink/sounds/<lang>:ro` | `svx sounds install` |
-| `~/.svxlink/hardware.json` | user | audio/PTT/squelch OperatorIntent for the HARDWARE block | wizard (`svx audio` / `svx ptt`) via `detect-hardware.sh` + merge |
+| `~/.svxlink/hardware.json` | user | PTT/squelch/mitigation OperatorIntent + fresh audio detection for the HARDWARE block | wizard (`svx audio` / `svx ptt`) via `detect-hardware.sh` + merge |
 | `~/.svxlink/snapshots/` | user | `<UTC-ts>-<name>` copy of every file the tooling overwrites | `snapshot_existing()` |
 | `~/.svxlink/last-good.json` | user | bootstrappedAt + last healthy image digest/tag — rollback anchor and VERIFY_MODE key | installer + `svx update` |
 | `~/.svxlink/payload/` | user | staged renderer, templates, `detect-hardware.sh`, `seed-config.sh`, `lib/*.sh`, dashboard Containerfile + seeds — what makes `svx render-server`/`svx dashboard` work with no installer tree | installer + `svx self-update` |

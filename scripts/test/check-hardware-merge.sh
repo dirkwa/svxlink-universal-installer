@@ -2,17 +2,24 @@
 # Pins the operator-choice preservation contract of the hardware.json
 # merge. detect-hardware.sh always re-emits fresh defaults, and a
 # documented re-run (`curl … | bash`, or a later `svx audio`/`svx ptt`
-# pass) must not silently reset the operator's confirmed picks: RX/TX
-# cards, PTT wiring, squelch mode, and the PipeWire/Pulse mitigation
-# answer (which gates a re-prompt).
+# pass) must not silently reset the operator's confirmed picks: PTT
+# wiring, squelch mode, and the PipeWire/Pulse mitigation answer (which
+# gates a re-prompt).
 #
 # The filter under test is the SAME one the wizards run: both source
 # installer/linux/lib/hardware-merge.sh, so this test can't pass against
-# a stale copy. Two rules verified:
-#   1. Operator sections (audio/ptt/squelch) carried with explicit has(),
-#      never `//` — jq's `//` treats stored false/null as empty and would
-#      resurrect an operator's opt-out/null on the next detection run.
-#   2. Inventory (serial[], gpio) always takes the FRESH values — stale
+# a stale copy. Three rules verified:
+#   1. Operator sections (ptt/squelch/audio.hostAudioMitigation) carried
+#      with explicit has(), never `//` — jq's `//` treats stored
+#      false/null as empty and would resurrect an operator's opt-out on
+#      the next detection run.
+#   2. audio.rx/tx always take the FRESH detection values — hardware.json
+#      audio is detection output, NOT OperatorIntent. Carrying it froze
+#      the first run's (possibly wrong) proposal forever: on the Pi 4 a
+#      stale tx=Headphones from the pre-capture-fix detection overrode
+#      every corrected re-detect and defeated the install-time parking.
+#      The operator's real audio choice lives in svxlink.conf.
+#   3. Inventory (serial[], gpio) always takes the FRESH values — stale
 #      inventory is what produces AddDevice= lines at vanished nodes.
 #
 # Run from the repo root.
@@ -64,7 +71,7 @@ cat >"$tmp/fresh.json" <<'JSON'
 }
 JSON
 
-# --- 1. Operator choices survive a re-detect ----------------------------
+# --- 1. Operator choices survive; detection audio does NOT --------------
 cat >"$tmp/old.json" <<'JSON'
 {
   "audio": {
@@ -82,8 +89,8 @@ cat >"$tmp/old.json" <<'JSON'
 }
 JSON
 hardware_merge "$tmp/old.json" "$tmp/fresh.json" >"$tmp/merged.json"
-check "operator RX card survives re-detect"        '.audio.rx.card'            "OldRx"
-check "operator TX card survives re-detect"        '.audio.tx.card'            "OldTx"
+check "fresh RX detection wins over stored audio"   '.audio.rx.card'            "Fresh"
+check "fresh TX detection wins over stored audio"   '.audio.tx.card'            "Fresh"
 check "hostAudioMitigation choice carried"          '.audio.hostAudioMitigation' "mask"
 check "operator PTT wiring survives re-detect"      '.ptt.type'                 "hidraw"
 check "false-y ptt.invert carried verbatim (has(), not //)" '.ptt.invert'      "false"
@@ -93,12 +100,31 @@ check "fresh serial inventory wins (byId)"          '.serial[0].byId'           
 check "fresh gpio inventory wins (model)"           '.gpio.model'               "rpi4"
 check "fresh gpio inventory wins (chip count)"      '.gpio.chips | length'      "2"
 
-# --- 2. Stored false-y sections are NOT resurrected by fresh defaults ---
-# A stored null audio/ptt (host had no card / operator never configured
-# PTT) is a value, not an absence: `//` would replace it with the fresh
-# first-card default and silently re-point svxlink at hardware the
-# operator never picked. has() must carry the null through (audio then
-# gets only the hostAudioMitigation backstop key).
+# --- 2. THE Pi 4 regression: stale tx must not defeat a corrected detect -
+# Old file: the pre-capture-fix detection proposed the onboard bcm2835
+# for tx. Fresh (corrected) detection: no capture card -> rx AND tx null.
+# The merge must let the fresh nulls through so install.sh parks the
+# logic sides — carrying the stale audio is exactly what crashlooped the
+# real Pi 4 a second time.
+cat >"$tmp/fresh-nullaudio.json" <<'JSON'
+{
+  "audio": { "rx": null, "tx": null },
+  "ptt": { "type": "none", "device": "", "pin": "", "invert": false },
+  "squelch": { "type": "VOX" },
+  "serial": [],
+  "gpio": { "model": "rpi4", "chips": ["/dev/gpiochip0"] }
+}
+JSON
+hardware_merge "$tmp/old.json" "$tmp/fresh-nullaudio.json" >"$tmp/merged.json"
+check "stale stored tx does NOT override a corrected null detect" '.audio.tx'  "null"
+check "stale stored rx does NOT override a corrected null detect" '.audio.rx'  "null"
+check "mitigation still carried alongside the fresh nulls" '.audio.hostAudioMitigation' "mask"
+
+# --- 3. Operator false-y sections are NOT resurrected by fresh defaults -
+# A stored null ptt (operator never configured PTT) is a value, not an
+# absence: `//` would replace it with the fresh default. has() must carry
+# the null through. Audio in the same old file is null too — and per rule
+# 2 the FRESH audio wins (plus the mitigation backstop).
 cat >"$tmp/old-null.json" <<'JSON'
 {
   "audio": null,
@@ -106,11 +132,11 @@ cat >"$tmp/old-null.json" <<'JSON'
 }
 JSON
 hardware_merge "$tmp/old-null.json" "$tmp/fresh.json" >"$tmp/merged.json"
-check "stored null audio not resurrected to the fresh card" '.audio | has("rx")' "false"
-check "stored null ptt carried as null"                      '.ptt'               "null"
-check "mitigation backstop lands on the null-audio carry"    '.audio.hostAudioMitigation' "none"
+check "null old audio: fresh detection wins (rule 2)"  '.audio.rx.card' "Fresh"
+check "stored null ptt carried as null"                '.ptt'           "null"
+check "mitigation backstop lands when old file had none" '.audio.hostAudioMitigation' "none"
 
-# --- 3. Legacy file without hostAudioMitigation gets the backstop -------
+# --- 4. Legacy file without hostAudioMitigation gets the backstop -------
 # (pre-key hardware.json: without the backstop the wizard would lose its
 # "already answered" marker and re-prompt forever.)
 cat >"$tmp/old-legacy.json" <<'JSON'
@@ -122,10 +148,10 @@ cat >"$tmp/old-legacy.json" <<'JSON'
 }
 JSON
 hardware_merge "$tmp/old-legacy.json" "$tmp/fresh.json" >"$tmp/merged.json"
-check "legacy audio carry keeps the operator card" '.audio.rx.card'             "OldRx"
-check "legacy audio carry gains the mitigation backstop" '.audio.hostAudioMitigation' "none"
+check "legacy audio does not shadow fresh detection"     '.audio.rx.card'             "Fresh"
+check "legacy audio without the key gets the backstop"   '.audio.hostAudioMitigation' "none"
 
-# --- 4. First merge ever (empty old file) keeps fresh detection ---------
+# --- 5. First merge ever (empty old file) keeps fresh detection ---------
 echo '{}' >"$tmp/old-empty.json"
 hardware_merge "$tmp/old-empty.json" "$tmp/fresh.json" >"$tmp/merged.json"
 check "no old audio section: fresh detection kept"  '.audio.rx.card'  "Fresh"
@@ -136,4 +162,4 @@ if (( fail )); then
     echo "[ERR] hardware.json merge contract broken — see entries above." >&2
     exit 1
 fi
-echo "[OK] hardware.json merge preserves operator choices and refreshes inventory."
+echo "[OK] hardware.json merge carries operator choices, refreshes detection + inventory."
