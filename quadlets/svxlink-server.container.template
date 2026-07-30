@@ -1,0 +1,152 @@
+[Unit]
+Description=SvxLink node (managed by svxlink-universal-installer)
+# Crashloop guard. Belongs in [Unit] — systemd silently ignores these
+# keys when placed in [Service] (the signalk reference lost them exactly
+# that way: the journal logged `Unknown key 'StartLimitIntervalSec' in
+# section [Service], ignoring.` and the unit retried forever).
+#
+# Interval sized against TimeoutStartSec=300 below. On an SD-card host
+# `podman run --replace` can take the full start timeout to create the
+# container under I/O contention; a failed attempt then costs up to
+# TimeoutStartSec + RestartSec = 310s. For the guard to allow all BURST=5
+# genuine (slow-but-eventually-good) attempts before declaring `failed`,
+# the window must exceed (5-1)*310 = 1240s — rounded to 1800s (30 min).
+# A real crashloop (bad svxlink.conf, missing AddDevice source) exits in
+# seconds, so it still trips the guard long before 30 min; the wide window
+# only stops penalizing a slow-but-recovering start.
+StartLimitIntervalSec=1800
+StartLimitBurst=5
+
+# Suppress Quadlet's implicit network-readiness dependency. podman 5.x
+# adds a Wants/After on its user-session network-wait shim to EVERY
+# generated user unit unconditionally. That shim loops
+# `until systemctl is-active <net target>; sleep 0.5; done`, and because a
+# user session never activates that target it blocks unit start until its
+# 90s timeout while flooding the journal with `sh[NNNN]: inactive` on any
+# host where the system network hasn't settled yet (fresh Pis especially).
+# DefaultDependencies=false (the [Quadlet]-section key, per
+# podman-systemd.unit(5)) is the documented suppression. NOTE: do NOT name
+# the shim service verbatim anywhere in this file — the generator scans the
+# source text and re-injects the dependency if it sees that string, undoing
+# this. This unit runs Network=host and binds the host's already-up
+# interfaces directly, so the wait buys nothing here.
+[Quadlet]
+DefaultDependencies=false
+
+[Container]
+# The tag is the operator's channel intent (`svx channel` rewrites it:
+# :latest / :master roll, a version tag pins, a digest pin is what
+# auto-rollback leaves behind). Re-renders preserve the LIVE Image= line —
+# see render-server-quadlet.sh.
+Image=ghcr.io/dirkwa/svxlink-server:latest
+ContainerName=svxlink-server
+
+# Host networking, not pasta: EchoLink registers the OBSERVED UDP source
+# address with the directory server and embeds addressing in-protocol, so
+# pasta's NAT breaks the symmetric 5198/5199 UDP flows (and reflector UDP
+# audio has the same problem) unless every port is force-published both
+# ways. Host networking also makes outbound DNS behave like a native
+# install. There is no inbound port to publish on this unit at all.
+Network=host
+
+# NO UserNS= here — the image runs svxlink as container root, and under
+# rootless podman container uid 0 IS the invoking host user. That makes
+# the ~/.svxlink/{etc,log} bind mounts readable/writable with no chown
+# dances, and log files appear host-user-owned 0644 (umask 022) — exactly
+# what the read-only dashboard scraper needs. Never "fix" this to
+# UserNS=keep-id: combining --device with keep-id + keep-groups yields
+# nobody:nobody device nodes (podman#28364), and this is a device-heavy
+# stack (/dev/snd, hidraw PTT, gpiochips).
+#
+# Device ACCESS comes from the host user's supplementary groups
+# (audio/dialout/gpio, joined by the installer): crun's
+# keep-original-groups leaves them on the container process.
+GroupAdd=keep-groups
+
+# Set the container's /etc/localtime from the host zone (podman translates
+# this to `--tz=local`). Without it the container defaults to UTC and
+# time-scheduled logic (identification timers, TCL event clocks, QSO
+# timestamps the operator compares against wall clocks) disagrees with the
+# host. Requires podman >= 4.6 (we require 5.3).
+Timezone=local
+
+# C locale, no locales package in the image: the CN8VX dashboard parses
+# month-name log timestamps with C-locale regexes; a localized month name
+# silently blanks the dashboard.
+Environment=LC_ALL=C
+# Explicit config path. The image deliberately leaves SVXLINK_CONF unset
+# (its entrypoint defaults per-program so `podman run … remotetrx` picks
+# remotetrx.conf); this unit runs the svxlink node, so pin it.
+Environment=SVXLINK_CONF=/etc/svxlink/svxlink.conf
+# File logging contract with the image entrypoint (docs/image-contract.md
+# in svxlink-images — canonical names, do NOT rename): a set
+# SVXLINK_LOGFILE makes svxlink write this file while the entrypoint
+# mirrors it to stdout (`tail -n0 -F`, so `podman logs` still shows
+# everything) and rotates it at SVXLINK_LOG_MAXSIZE bytes via
+# mv → .1 + SIGHUP. Exactly one .1 sibling ever exists — the dashboard
+# reads LOGFILE and LOGFILE.1, nothing older. The host side of this path
+# is the ~/.svxlink/log bind mount below.
+Environment=SVXLINK_LOGFILE=/var/log/svxlink/svxlink
+Environment=SVXLINK_LOG_MAXSIZE=10485760
+
+# Config tree, seeded once by the installer from the image's pristine
+# /etc/svxlink (podman create + cp), then owned by the operator /
+# `svx config`. rw: svxlink writes state here (e.g. generated keys).
+Volume=%h/.svxlink/etc:/etc/svxlink:rw
+# Log dir — rw here, mounted READ-ONLY into the dashboard container.
+Volume=%h/.svxlink/log:/var/log/svxlink:rw
+
+Label=io.svxlink.managed-by=svxlink-universal-installer
+Label=io.svxlink.role=server
+
+# === BEGIN USER ADDITIONS ===
+# Hand-edits below this line are preserved across re-renders and updates.
+# Add custom mounts, capabilities, or environment variables here. The
+# renderer preserves everything between the BEGIN/END markers verbatim.
+# === END USER ADDITIONS ===
+
+# === BEGIN HARDWARE (managed by svxlink-universal-installer) ===
+# AddDevice=/Volume= lines rendered from ~/.svxlink/hardware.json — do not
+# edit here; run `svx audio` / `svx ptt` / `svx sounds` instead.
+# === END HARDWARE ===
+
+[Service]
+# Restart=always rather than on-failure: `svxlink` exits 0 on a SIGTERM
+# shutdown and on some operator-triggered reloads; on-failure would leave
+# the repeater down after a clean exit. The crashloop guard
+# (StartLimitIntervalSec/StartLimitBurst, in [Unit] above) still catches
+# genuine failure loops — after 5 starts in 30 minutes the unit goes to
+# `failed` and stays there for `svx recover` to find.
+Restart=always
+RestartSec=10
+# SD-card headroom: `podman run --replace` can take minutes to CREATE the
+# container under I/O contention on a Pi; a too-small timeout SIGKILLs a
+# start that would have succeeded.
+TimeoutStartSec=300
+# The image entrypoint forwards TERM to svxlink and waits; this is the
+# hard stop bound (systemd SIGKILLs the cgroup after it). 30s is generous
+# for svxlink's "SIGTERM received. Shutting down application..." path.
+TimeoutStopSec=30
+# DNS wait. MUST live in [Service], never [Container]: Quadlet rejects
+# unknown keys per section, and an ExecStartPre under [Container] makes
+# the generator refuse the WHOLE unit — `systemctl start` then reports
+# "Unit not found" with no other clue. [Service] is also semantically
+# right: the wait runs against the HOST's resolv.conf, before `podman run`
+# snapshots it into the container.
+#
+# Why wait at all: podman copies /etc/resolv.conf once per container
+# CREATE. On hosts whose resolv.conf lives under /run (systemd-resolved,
+# resolvconf, NetworkManager symlink mode) a boot that beats DHCP hands
+# the container an EMPTY resolver list, and EchoLink directory login —
+# all outbound DNS in svxlink — stays dead until something recreates the
+# container. Waiting up to 15s covers the common case (router already up,
+# DHCP lands seconds after boot) without costing a restart. Always exits
+# 0, and the leading '-' additionally tells systemd to ignore any failure
+# of this line: a host with no network at all (off-grid repeater site)
+# must still get its svxlink, just 15s later. The cold-power-on case —
+# the router itself needs minutes — is covered by `svx resolv-watch`.
+# Counts against TimeoutStartSec=300 above, well inside that budget.
+ExecStartPre=-/bin/sh -c 'for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do grep -qs "^nameserver" /etc/resolv.conf && break; sleep 1; done; exit 0'
+
+[Install]
+WantedBy=default.target
