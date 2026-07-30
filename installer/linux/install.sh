@@ -1097,6 +1097,14 @@ STARTED_THIS_RUN=0
 start_server_unit() {
     # $1 = systemctl verb (start|restart)
     local verb=$1
+    # A prior crashloop that exhausted StartLimitBurst leaves the unit in
+    # a failed start-limit state for up to StartLimitIntervalSec (30 min),
+    # and systemd then rejects even a DELIBERATE start with "Start request
+    # repeated too quickly" — the exact trap of a re-install right after
+    # fixing a crashloop's root cause (bit the Pi 4: the audio fix was in
+    # place, the re-run's start was refused anyway). reset-failed clears
+    # the counter; the crashloop guard still protects unattended restarts.
+    systemctl --user reset-failed svxlink-server.service 2>/dev/null || true
     if systemctl --user "$verb" svxlink-server.service; then
         ok "svxlink-server ${verb}ed"
         return 0

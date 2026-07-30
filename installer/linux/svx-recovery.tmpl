@@ -92,11 +92,23 @@ restore_one() {
 reload_and_restart() {
     local services=("$@")
     systemctl --user daemon-reload
-    local s
+    local s state
     for s in ${services[@]+"${services[@]}"}; do
-        # try-restart: only bounce units that were running — never start a
-        # unit the operator deliberately stopped.
-        systemctl --user try-restart "${s}.service" || true
+        state=$(systemctl --user is-active "${s}.service" 2>/dev/null || true)
+        if [[ "$state" == "failed" ]]; then
+            # A rollback is EXACTLY when the unit is likely sitting in a
+            # crashloop's failed start-limit state: try-restart skips
+            # non-running units entirely, and without reset-failed systemd
+            # rejects the start for up to 30 min ("Start request repeated
+            # too quickly"). A failed unit is not an operator stop — start
+            # it after restoring the good quadlet.
+            systemctl --user reset-failed "${s}.service" 2>/dev/null || true
+            systemctl --user start "${s}.service" || true
+        else
+            # try-restart: only bounce units that were running — never
+            # start a unit the operator deliberately stopped.
+            systemctl --user try-restart "${s}.service" || true
+        fi
     done
 }
 
